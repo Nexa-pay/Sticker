@@ -16,6 +16,9 @@ from aiogram.types import FSInputFile
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# Add authorized usernames here (lowercase, without the @ symbol)
+ADMIN_USERNAMES = ["irtzaakash", "itzaakash"]
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -23,6 +26,11 @@ class CloneStates(StatesGroup):
     waiting_for_sticker = State()
     waiting_for_title = State()
     waiting_for_name = State()
+
+def is_admin(username: str) -> bool:
+    if not username:
+        return False
+    return username.lower() in ADMIN_USERNAMES
 
 def make_progress_bar(current: int, total: int, length: int = 15) -> str:
     if total == 0: return f"`[{'░'*length}] 0%`"
@@ -33,6 +41,10 @@ def make_progress_bar(current: int, total: int, length: int = 15) -> str:
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.username):
+        await message.reply("🚫 **Access Denied:** This is a private bot.")
+        return
+
     await message.reply(
         "👋 **Welcome to the Elite Sticker Creator!**\n\n"
         "1️⃣ **Forward me a sticker** to clone an entire pack.\n"
@@ -41,12 +53,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
     )
     await state.set_state(CloneStates.waiting_for_sticker)
 
-# --- HANDLER 1: FORWARDED STICKERS ---
 @dp.message(CloneStates.waiting_for_sticker, F.sticker)
 async def process_sticker(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.username): return
+
     sticker = message.sticker
     if not sticker.set_name:
-        await message.reply("❌ This sticker doesn't belong to a pack. Please send a valid pack sticker or a ZIP file.")
+        await message.reply("❌ This sticker doesn't belong to a pack.")
         return
 
     wait_msg = await message.reply("🔍 Fetching pack details...")
@@ -75,14 +88,15 @@ async def process_sticker(message: types.Message, state: FSMContext):
     )
     await state.set_state(CloneStates.waiting_for_title)
 
-# --- HANDLER 2: ZIP FILES ---
 @dp.message(CloneStates.waiting_for_sticker, F.document)
 async def process_zip(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.username): return
+
     if not message.document.file_name.lower().endswith('.zip'):
-        await message.reply("❌ Please send a valid `.zip` file containing stickers.")
+        await message.reply("❌ Please send a valid `.zip` file.")
         return
 
-    wait_msg = await message.reply("📥 Downloading and extracting ZIP... Please wait ⏳")
+    wait_msg = await message.reply("📥 Downloading and extracting ZIP... ⏳")
     
     temp_dir = tempfile.mkdtemp()
     zip_path = os.path.join(temp_dir, "stickers.zip")
@@ -98,25 +112,22 @@ async def process_zip(message: types.Message, state: FSMContext):
             for file in files:
                 if file.lower().endswith(('.webm', '.webp', '.tgs')):
                     valid_files.append(os.path.join(root, file))
-    except Exception as e:
-        await wait_msg.edit_text("❌ Failed to read ZIP. Ensure it is not corrupted.")
+    except Exception:
+        await wait_msg.edit_text("❌ Failed to read ZIP.")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
     if not valid_files:
-        await wait_msg.edit_text("❌ No `.webm`, `.webp`, or `.tgs` files found inside the ZIP.")
+        await wait_msg.edit_text("❌ No `.webm`, `.webp`, or `.tgs` files found.")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
-    valid_files.sort() # Keep alphabetical order
+    valid_files.sort() 
     first_ext = valid_files[0].lower().split('.')[-1]
     
-    if first_ext == 'webm':
-        sticker_format = "video"
-    elif first_ext == 'tgs':
-        sticker_format = "animated"
-    else:
-        sticker_format = "static"
+    if first_ext == 'webm': sticker_format = "video"
+    elif first_ext == 'tgs': sticker_format = "animated"
+    else: sticker_format = "static"
 
     await state.update_data(
         original_stickers=valid_files,
@@ -135,9 +146,9 @@ async def process_zip(message: types.Message, state: FSMContext):
     )
     await state.set_state(CloneStates.waiting_for_title)
 
-# --- SHARED TITLE & NAME HANDLERS ---
 @dp.message(CloneStates.waiting_for_title, F.text)
 async def process_title(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.username): return
     await state.update_data(new_title=message.text)
     
     user_prefix = message.from_user.username or str(message.from_user.id)
@@ -146,7 +157,7 @@ async def process_title(message: types.Message, state: FSMContext):
     await message.reply(
         f"🔗 **Send me a Short Name for the link.**\n"
         f"Use English letters/numbers only.\n\n"
-        f"💡 *Example:* If you type `magic`, your final link will look like:\n"
+        f"💡 *Example:* If you type `magic`, your link will be:\n"
         f"`{user_prefix}_magic_by_Itzaakashbot`",
         parse_mode="Markdown"
     )
@@ -154,6 +165,7 @@ async def process_title(message: types.Message, state: FSMContext):
 
 @dp.message(CloneStates.waiting_for_name, F.text)
 async def process_name(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.username): return
     status_msg = await message.reply("🚀 Initializing creation sequence... ⏳")
     start_time = time.time()
     
@@ -168,20 +180,15 @@ async def process_name(message: types.Message, state: FSMContext):
     total_stickers = len(original_stickers)
     bot_info = await bot.get_me()
     
-    # 1. Format the Short Name: {user_prefix}_{clean_name}_by_{bot_username}
     user_prefix = message.from_user.username or str(message.from_user.id)
     user_prefix = re.sub(r'[^a-zA-Z0-9]', '', user_prefix).lower()
-    
     clean_short_name = re.sub(r'[^a-zA-Z0-9]', '', message.text).lower()
     if not clean_short_name: clean_short_name = "pack"
     
-    # Telegram max short name length is 64. Truncate clean_short_name to ensure it fits.
     max_clean_len = 64 - len(f"{user_prefix}__by_{bot_info.username}")
     clean_short_name = clean_short_name[:max_clean_len]
-
     full_short_name = f"{user_prefix}_{clean_short_name}_by_{bot_info.username}"
 
-    # 2. Prepare Stickers (Handle either Telegram file_ids OR local ZIP files)
     input_stickers = []
     if source_type == "pack":
         for st in original_stickers:
@@ -194,7 +201,7 @@ async def process_name(message: types.Message, state: FSMContext):
         for path in original_stickers:
             input_stickers.append(types.InputSticker(
                 sticker=FSInputFile(path), 
-                emoji_list=["😀"], # Default emoji for zip files
+                emoji_list=["😀"], 
                 format=sticker_format
             ))
 
@@ -202,7 +209,6 @@ async def process_name(message: types.Message, state: FSMContext):
         first_sticker = [input_stickers[0]]
         remaining_stickers = input_stickers[1:]
 
-        # 3. Create the Pack
         created = False
         while not created:
             try:
@@ -218,12 +224,17 @@ async def process_name(message: types.Message, state: FSMContext):
             except TelegramRetryAfter as e:
                 await asyncio.sleep(e.retry_after + 1)
 
-        # 4. Add remaining stickers
         total_added = 1
         failed = 0
+        consecutive_fails = 0
         last_edit_time = time.time()
 
         for st_input in remaining_stickers:
+            # Hard limit detection: If 3 consecutive stickers get rejected by Telegram, the pack is full.
+            if consecutive_fails >= 3:
+                print("Hit Telegram's strict pack size limit. Finalizing pack early.")
+                break
+
             added = False
             while not added:
                 try:
@@ -234,17 +245,18 @@ async def process_name(message: types.Message, state: FSMContext):
                     )
                     added = True
                     total_added += 1
-                    # Slower delay if uploading files from a ZIP to prevent heavy rate limits
-                    await asyncio.sleep(0.5 if source_type == "zip" else 0.3) 
+                    consecutive_fails = 0 
+                    # Slower upload prevents rate limits from triggering
+                    await asyncio.sleep(0.8) 
                     
                 except TelegramRetryAfter as e:
-                    await asyncio.sleep(e.retry_after + 0.5)
+                    await asyncio.sleep(e.retry_after + 1)
                 except Exception as e:
-                    print(f"Skipping sticker: {e}")
+                    print(f"Skipping sticker due to API error: {e}")
                     failed += 1
+                    consecutive_fails += 1
                     break
 
-            # 5. Live UI Update
             current_processed = total_added + failed
             current_time = time.time()
             if current_time - last_edit_time > 2.5 or current_processed == total_stickers:
@@ -256,7 +268,7 @@ async def process_name(message: types.Message, state: FSMContext):
                     f"{p_bar}\n\n"
                     f"📈 **Processed:** `{current_processed} / {total_stickers}`\n"
                     f"⏱ **Time Elapsed:** `{elapsed}s`\n"
-                    f"🔄 *Handling Telegram API securely...*"
+                    f"🔄 *Bypassing API restrictions safely...*"
                 )
                 try:
                     await status_msg.edit_text(ui_text, parse_mode="Markdown")
@@ -264,9 +276,8 @@ async def process_name(message: types.Message, state: FSMContext):
                 except Exception:
                     pass 
 
-        # 6. Success Output
         final_time = int(time.time() - start_time)
-        failed_text = f"\n⚠️ Skipped {failed} invalid files." if failed > 0 else ""
+        failed_text = f"\n⚠️ Reached limit: Capped pack at {total_added} stickers." if consecutive_fails >= 3 else ""
         
         await status_msg.edit_text(
             f"🎉 **Pack Ready!**\n\n"
@@ -282,7 +293,6 @@ async def process_name(message: types.Message, state: FSMContext):
         await status_msg.edit_text(f"❌ Critcal Error:\n{e}")
 
     finally:
-        # VERY IMPORTANT: Delete the extracted ZIP files from the VPS hard drive
         if source_type == "zip" and temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
             
