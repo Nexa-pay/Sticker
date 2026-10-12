@@ -6,7 +6,6 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-# Load token from .env file
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -37,15 +36,18 @@ async def process_sticker(message: types.Message, state: FSMContext):
         await message.reply(f"Could not fetch the pack: {e}")
         return
 
+    sticker_format = "animated" if sticker.is_animated else "video" if sticker.is_video else "static"
     await state.update_data(
         original_stickers=sticker_set.stickers,
-        sticker_format="animated" if sticker.is_animated else "video" if sticker.is_video else "static"
+        sticker_format=sticker_format
     )
     
+    # Updated text format requested by you
     await message.reply(
-        f"Pack found: **{sticker_set.title}** ({len(sticker_set.stickers)} stickers).\n\n"
-        f"What do you want the **Title** of your new pack to be?",
-        parse_mode="Markdown"
+        f"Pack found: {sticker_set.title} ({len(sticker_set.stickers)} stickers).\n\n"
+        f"What do you want the Title of your new pack to be?\n\n"
+        f"Bot name this @Itzaakashbot\n"
+        f"1st owner username @Irtzaakash"
     )
     await state.set_state(CloneStates.waiting_for_title)
 
@@ -75,14 +77,14 @@ async def process_name(message: types.Message, state: FSMContext):
     short_name = message.text.replace(" ", "_").lower()
     full_short_name = f"{short_name}_by_{bot_info.username}"
 
-        input_stickers = [
+    # THE FIX IS APPLIED HERE: Added format=sticker_format
+    input_stickers = [
         types.InputSticker(
             sticker=st.file_id, 
             emoji_list=[st.emoji] if st.emoji else ["😀"],
             format=sticker_format
         ) for st in original_stickers
     ]
-
 
     try:
         batch_1 = input_stickers[:50]
@@ -124,4 +126,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-  
