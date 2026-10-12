@@ -75,12 +75,14 @@ async def process_name(message: types.Message, state: FSMContext):
     short_name = message.text.replace(" ", "_").lower()
     full_short_name = f"{short_name}_by_{bot_info.username}"
 
-    input_stickers = [
+        input_stickers = [
         types.InputSticker(
             sticker=st.file_id, 
-            emoji_list=[st.emoji] if st.emoji else ["😀"]
+            emoji_list=[st.emoji] if st.emoji else ["😀"],
+            format=sticker_format
         ) for st in original_stickers
     ]
+
 
     try:
         batch_1 = input_stickers[:50]
