@@ -66,7 +66,7 @@ async def process_title(message: types.Message, state: FSMContext):
 
 @dp.message(CloneStates.waiting_for_name, F.text)
 async def process_name(message: types.Message, state: FSMContext):
-    status_msg = await message.reply("Cloning your pack... Please wait ⏳")
+    status_msg = await message.reply("Cloning your pack... This might take a minute to avoid rate limits ⏳")
     
     data = await state.get_data()
     original_stickers = data['original_stickers']
@@ -86,46 +86,52 @@ async def process_name(message: types.Message, state: FSMContext):
     ]
 
     try:
-        batch_1 = input_stickers[:50]
-        remaining = input_stickers[50:]
+        # STRATEGY: Create pack with ONLY 1 sticker first to avoid CreateNewStickerSet limits
+        first_sticker = [input_stickers[0]]
+        remaining_stickers = input_stickers[1:]
 
-        # Handle rate limits when creating the set
-        try:
-            await bot.create_new_sticker_set(
-                user_id=message.from_user.id,
-                name=full_short_name,
-                title=new_title,
-                stickers=batch_1,
-                sticker_format=sticker_format
-            )
-        except TelegramRetryAfter as e:
-            await status_msg.edit_text(f"Telegram rate limit hit. Pausing for {e.retry_after} seconds... ⏳")
-            await asyncio.sleep(e.retry_after)
-            await bot.create_new_sticker_set(
-                user_id=message.from_user.id,
-                name=full_short_name,
-                title=new_title,
-                stickers=batch_1,
-                sticker_format=sticker_format
-            )
+        # 1. Create the pack (with an infinite retry loop just in case)
+        created = False
+        while not created:
+            try:
+                await bot.create_new_sticker_set(
+                    user_id=message.from_user.id,
+                    name=full_short_name,
+                    title=new_title,
+                    stickers=first_sticker,
+                    sticker_format=sticker_format
+                )
+                created = True
+            except TelegramRetryAfter as e:
+                wait_time = e.retry_after + 2  # Add 2 seconds for safety
+                await status_msg.edit_text(f"Telegram cooling down. Pausing for {wait_time} seconds... ⏳")
+                await asyncio.sleep(wait_time)
 
-        # Handle rate limits when adding remaining stickers
-        for i, st_input in enumerate(remaining):
-            success = False
-            while not success:
+        # 2. Add the rest of the stickers one by one with a delay
+        total_added = 1
+        for st_input in remaining_stickers:
+            added = False
+            while not added:
                 try:
                     await bot.add_sticker_to_set(
                         user_id=message.from_user.id,
                         name=full_short_name,
                         sticker=st_input
                     )
-                    success = True
+                    added = True
+                    total_added += 1
+                    
+                    # Intentional delay to NEVER hit the rate limit again
+                    await asyncio.sleep(1.2) 
+                    
                 except TelegramRetryAfter as e:
-                    await asyncio.sleep(e.retry_after) # Wait silently and try again
-            
-            if i % 10 == 0:
-                await status_msg.edit_text(f"Adding remaining stickers... {50 + i}/{len(input_stickers)} ⏳")
-                await asyncio.sleep(1)
+                    wait_time = e.retry_after + 2
+                    await status_msg.edit_text(f"Adding paused by Telegram. Waiting {wait_time} seconds... ⏳")
+                    await asyncio.sleep(wait_time)
+
+            # Update the user every 5 stickers so they know it's working
+            if total_added % 5 == 0:
+                await status_msg.edit_text(f"Cloning carefully to avoid limits... {total_added}/{len(input_stickers)} uploaded ⏳")
 
         await status_msg.edit_text(
             f"🎉 **Pack Cloned Successfully!**\n\n"
