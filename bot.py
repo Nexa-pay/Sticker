@@ -48,7 +48,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await message.reply(
         "👋 **Welcome to the Elite Sticker Creator!**\n\n"
         "1️⃣ **Forward me a sticker** to clone an entire pack.\n"
-        "2️⃣ **Send me a `.zip` file** containing `.webm`, `.webp`, or `.tgs` files to build a pack from scratch.",
+        "2️⃣ **Send Premium Emojis** in a message to convert them.\n"
+        "3️⃣ **Send a `.zip` file** containing `.webm`, `.webp`, or `.tgs` files to build a pack from scratch.",
         parse_mode="Markdown"
     )
     await state.set_state(CloneStates.waiting_for_sticker)
@@ -141,6 +142,49 @@ async def process_zip(message: types.Message, state: FSMContext):
         f"📦 **ZIP Extracted Successfully!**\n"
         f"📊 **Files Found:** `{len(valid_files)}`\n"
         f"⚙️ **Format Detected:** `{sticker_format.title()}`\n\n"
+        f"📝 **What do you want the Title of your new pack to be?**",
+        parse_mode="Markdown"
+    )
+    await state.set_state(CloneStates.waiting_for_title)
+
+# --- NEW: HANDLE PREMIUM EMOJIS ---
+@dp.message(CloneStates.waiting_for_sticker)
+async def process_premium_emojis(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.username): return
+    
+    entities = message.entities or message.caption_entities or []
+    custom_emoji_ids = [e.custom_emoji_id for e in entities if e.type == "custom_emoji"]
+    
+    if not custom_emoji_ids:
+        await message.reply("❌ I didn't find any Stickers, ZIPs, or Premium Emojis in that message.")
+        return
+
+    wait_msg = await message.reply("🔍 Extracting Premium Emojis...")
+    
+    try:
+        stickers = await bot.get_custom_emoji_stickers(custom_emoji_ids=custom_emoji_ids)
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Failed to fetch emojis: `{e}`", parse_mode="Markdown")
+        return
+
+    if not stickers:
+        await wait_msg.edit_text("❌ No valid premium emojis found.")
+        return
+
+    first_sticker = stickers[0]
+    sticker_format = "animated" if first_sticker.is_animated else "video" if first_sticker.is_video else "static"
+
+    await state.update_data(
+        original_stickers=stickers,
+        sticker_format=sticker_format,
+        sticker_type="regular",
+        source_type="pack"
+    )
+
+    await wait_msg.edit_text(
+        f"🌟 **Premium Emojis Extracted!**\n"
+        f"📊 **Emojis Found:** `{len(stickers)}`\n"
+        f"⚙️ **Format:** `{sticker_format.title()}`\n\n"
         f"📝 **What do you want the Title of your new pack to be?**",
         parse_mode="Markdown"
     )
