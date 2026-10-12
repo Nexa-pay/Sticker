@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
@@ -18,9 +19,20 @@ class CloneStates(StatesGroup):
     waiting_for_title = State()
     waiting_for_name = State()
 
+def make_progress_bar(current: int, total: int, length: int = 15) -> str:
+    """Generates a text-based progress bar."""
+    percent = current / total
+    filled = int(length * percent)
+    bar = '█' * filled + '░' * (length - filled)
+    return f"`[{bar}] {percent:.0%}`"
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    await message.reply("Send or forward me any sticker, and I will clone the entire pack for you!")
+    await message.reply(
+        "👋 **Welcome to the Advanced Sticker Cloner!**\n\n"
+        "Send or forward me any sticker, and I will clone the entire pack for you instantly.",
+        parse_mode="Markdown"
+    )
     await state.set_state(CloneStates.waiting_for_sticker)
 
 @dp.message(CloneStates.waiting_for_sticker, F.sticker)
@@ -28,13 +40,15 @@ async def process_sticker(message: types.Message, state: FSMContext):
     sticker = message.sticker
     
     if not sticker.set_name:
-        await message.reply("This sticker doesn't belong to a pack. Please send a sticker from a valid pack.")
+        await message.reply("❌ This sticker doesn't belong to a pack. Please send a valid pack sticker.")
         return
+
+    wait_msg = await message.reply("🔍 Fetching pack details...")
 
     try:
         sticker_set = await bot.get_sticker_set(name=sticker.set_name)
     except Exception as e:
-        await message.reply(f"Could not fetch the pack: {e}")
+        await wait_msg.edit_text(f"❌ Could not fetch the pack: `{e}`", parse_mode="Markdown")
         return
 
     sticker_format = "animated" if sticker.is_animated else "video" if sticker.is_video else "static"
@@ -43,11 +57,13 @@ async def process_sticker(message: types.Message, state: FSMContext):
         sticker_format=sticker_format
     )
     
-    await message.reply(
-        f"Pack found: {sticker_set.title} ({len(sticker_set.stickers)} stickers).\n\n"
-        f"What do you want the Title of your new pack to be?\n\n"
-        f"Bot name this @Itzaakashbot\n"
-        f"1st owner username @Irtzaakash"
+    await wait_msg.edit_text(
+        f"📦 **Pack Found:** `{sticker_set.title}`\n"
+        f"📊 **Total Stickers:** `{len(sticker_set.stickers)}`\n"
+        f"⚙️ **Format:** `{sticker_format.title()}`\n\n"
+        f"📝 **What do you want the Title of your new pack to be?**\n\n"
+        f"*(Bot name: @Itzaakashbot | 1st owner: @Irtzaakash)*",
+        parse_mode="Markdown"
     )
     await state.set_state(CloneStates.waiting_for_title)
 
@@ -58,20 +74,24 @@ async def process_title(message: types.Message, state: FSMContext):
     suffix = f"_by_{bot_info.username}"
     
     await message.reply(
-        f"Send me a **Short Name** for the link (English letters/numbers).\n"
-        f"*(I will automatically add `{suffix}` to it)*",
+        f"🔗 **Send me a Short Name for the link.**\n"
+        f"Use English letters/numbers only.\n\n"
+        f"💡 *Example:* `my_cool_stickers`\n"
+        f"*(Telegram requires it to end with `{suffix}`. I will add this automatically!)*",
         parse_mode="Markdown"
     )
     await state.set_state(CloneStates.waiting_for_name)
 
 @dp.message(CloneStates.waiting_for_name, F.text)
 async def process_name(message: types.Message, state: FSMContext):
-    status_msg = await message.reply("Cloning your pack... This might take a minute to avoid rate limits ⏳")
+    status_msg = await message.reply("🚀 Initializing cloning sequence...")
+    start_time = time.time()
     
     data = await state.get_data()
     original_stickers = data['original_stickers']
     sticker_format = data['sticker_format']
     new_title = data['new_title']
+    total_stickers = len(original_stickers)
     
     bot_info = await bot.get_me()
     short_name = message.text.replace(" ", "_").lower()
@@ -86,11 +106,10 @@ async def process_name(message: types.Message, state: FSMContext):
     ]
 
     try:
-        # STRATEGY: Create pack with ONLY 1 sticker first to avoid CreateNewStickerSet limits
+        # Create pack with 1 sticker to safely initialize
         first_sticker = [input_stickers[0]]
         remaining_stickers = input_stickers[1:]
 
-        # 1. Create the pack (with an infinite retry loop just in case)
         created = False
         while not created:
             try:
@@ -103,12 +122,13 @@ async def process_name(message: types.Message, state: FSMContext):
                 )
                 created = True
             except TelegramRetryAfter as e:
-                wait_time = e.retry_after + 2  # Add 2 seconds for safety
-                await status_msg.edit_text(f"Telegram cooling down. Pausing for {wait_time} seconds... ⏳")
-                await asyncio.sleep(wait_time)
+                await status_msg.edit_text(f"⚠️ Telegram server cooldown. Starting in {e.retry_after}s...")
+                await asyncio.sleep(e.retry_after + 1)
 
-        # 2. Add the rest of the stickers one by one with a delay
+        # Loop and add remaining stickers at optimized speed
         total_added = 1
+        last_edit_time = time.time()
+
         for st_input in remaining_stickers:
             added = False
             while not added:
@@ -121,32 +141,51 @@ async def process_name(message: types.Message, state: FSMContext):
                     added = True
                     total_added += 1
                     
-                    # Intentional delay to NEVER hit the rate limit again
-                    await asyncio.sleep(1.2) 
+                    # Push fast, but leave a tiny 0.2s breather to prevent standard bans
+                    await asyncio.sleep(0.2) 
                     
                 except TelegramRetryAfter as e:
-                    wait_time = e.retry_after + 2
-                    await status_msg.edit_text(f"Adding paused by Telegram. Waiting {wait_time} seconds... ⏳")
-                    await asyncio.sleep(wait_time)
+                    # If we hit the absolute ceiling, respect the exact timeout silently
+                    await asyncio.sleep(e.retry_after + 0.5)
 
-            # Update the user every 5 stickers so they know it's working
-            if total_added % 5 == 0:
-                await status_msg.edit_text(f"Cloning carefully to avoid limits... {total_added}/{len(input_stickers)} uploaded ⏳")
+            # Live Update UI - strictly update every 2.5 seconds to avoid edit limits
+            current_time = time.time()
+            if current_time - last_edit_time > 2.5 or total_added == total_stickers:
+                p_bar = make_progress_bar(total_added, total_stickers)
+                elapsed = int(current_time - start_time)
+                
+                ui_text = (
+                    f"⚡ **Cloning in Progress...**\n\n"
+                    f"{p_bar}\n\n"
+                    f"📈 **Processed:** `{total_added} / {total_stickers}`\n"
+                    f"⏱ **Time Elapsed:** `{elapsed}s`\n"
+                    f"🔄 *Optimizing speed to prevent limits...*"
+                )
+                try:
+                    await status_msg.edit_text(ui_text, parse_mode="Markdown")
+                    last_edit_time = current_time
+                except Exception:
+                    pass # Ignore if edit fails due to exact match or slight rate limit
 
+        # Final Success Message
+        final_time = int(time.time() - start_time)
         await status_msg.edit_text(
-            f"🎉 **Pack Cloned Successfully!**\n\n"
-            f"Add it here: [t.me/addstickers/{full_short_name}](https://t.me/addstickers/{full_short_name})",
+            f"🎉 **Pack Successfully Cloned!**\n\n"
+            f"✅ **Total Stickers:** `{total_added}`\n"
+            f"⏱ **Total Time:** `{final_time} seconds`\n\n"
+            f"👇 **Click below to add your new pack:**\n"
+            f"👉 [t.me/addstickers/{full_short_name}](https://t.me/addstickers/{full_short_name})",
             parse_mode="Markdown",
             disable_web_page_preview=True
         )
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Failed to create pack.\nError: `{e}`", parse_mode="Markdown")
+        await status_msg.edit_text(f"❌ **Critcal Error:**\n`{e}`", parse_mode="Markdown")
 
     await state.clear()
 
 async def main():
-    print("Cloner Bot is running...")
+    print("Advanced Cloner Bot is running...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
