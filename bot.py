@@ -5,6 +5,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramRetryAfter
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -42,7 +43,6 @@ async def process_sticker(message: types.Message, state: FSMContext):
         sticker_format=sticker_format
     )
     
-    # Updated text format requested by you
     await message.reply(
         f"Pack found: {sticker_set.title} ({len(sticker_set.stickers)} stickers).\n\n"
         f"What do you want the Title of your new pack to be?\n\n"
@@ -77,7 +77,6 @@ async def process_name(message: types.Message, state: FSMContext):
     short_name = message.text.replace(" ", "_").lower()
     full_short_name = f"{short_name}_by_{bot_info.username}"
 
-    # THE FIX IS APPLIED HERE: Added format=sticker_format
     input_stickers = [
         types.InputSticker(
             sticker=st.file_id, 
@@ -90,20 +89,40 @@ async def process_name(message: types.Message, state: FSMContext):
         batch_1 = input_stickers[:50]
         remaining = input_stickers[50:]
 
-        await bot.create_new_sticker_set(
-            user_id=message.from_user.id,
-            name=full_short_name,
-            title=new_title,
-            stickers=batch_1,
-            sticker_format=sticker_format
-        )
-
-        for i, st_input in enumerate(remaining):
-            await bot.add_sticker_to_set(
+        # Handle rate limits when creating the set
+        try:
+            await bot.create_new_sticker_set(
                 user_id=message.from_user.id,
                 name=full_short_name,
-                sticker=st_input
+                title=new_title,
+                stickers=batch_1,
+                sticker_format=sticker_format
             )
+        except TelegramRetryAfter as e:
+            await status_msg.edit_text(f"Telegram rate limit hit. Pausing for {e.retry_after} seconds... ⏳")
+            await asyncio.sleep(e.retry_after)
+            await bot.create_new_sticker_set(
+                user_id=message.from_user.id,
+                name=full_short_name,
+                title=new_title,
+                stickers=batch_1,
+                sticker_format=sticker_format
+            )
+
+        # Handle rate limits when adding remaining stickers
+        for i, st_input in enumerate(remaining):
+            success = False
+            while not success:
+                try:
+                    await bot.add_sticker_to_set(
+                        user_id=message.from_user.id,
+                        name=full_short_name,
+                        sticker=st_input
+                    )
+                    success = True
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after) # Wait silently and try again
+            
             if i % 10 == 0:
                 await status_msg.edit_text(f"Adding remaining stickers... {50 + i}/{len(input_stickers)} ⏳")
                 await asyncio.sleep(1)
