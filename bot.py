@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -22,12 +22,10 @@ OWNER_ID = int(os.getenv("OWNER_ID", 0))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# MongoDB Setup
 db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client["sticker_bot"]
 users_col = db["users"]
 
-# --- FSM STATES ---
 class CloneStates(StatesGroup):
     waiting_for_sticker = State()
     waiting_for_pack_type = State()
@@ -39,7 +37,6 @@ class AdminStates(StatesGroup):
     waiting_for_remove_admin = State()
     waiting_for_broadcast = State()
 
-# --- DATABASE HELPERS ---
 async def init_user(user_id: int, username: str):
     user = await users_col.find_one({"user_id": user_id})
     if not user:
@@ -53,32 +50,32 @@ async def get_role(user_id: int) -> str:
     user = await users_col.find_one({"user_id": user_id})
     return user.get("role", "user") if user else "user"
 
-# --- UI HELPERS ---
 def make_progress_bar(current: int, total: int, length: int = 15) -> str:
     if total == 0: return f"`[{'░'*length}] 0%`"
     percent = min(current / total, 1.0)
     filled = int(length * percent)
     return f"`[{'█' * filled}{'░' * (length - filled)}] {percent:.0%}`"
 
+# Colorful "Premium-style" Admin Panel
 def admin_panel_keyboard(role: str):
     buttons = [
-        [InlineKeyboardButton(text="📊 View Stats", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📢 Broadcast Message", callback_data="admin_broadcast")]
+        [InlineKeyboardButton(text="🟣 View Bot Statistics", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🟢 Broadcast Message", callback_data="admin_broadcast")]
     ]
     if role == "owner":
         buttons.append([
-            InlineKeyboardButton(text="✅ Add Admin", callback_data="admin_add"),
-            InlineKeyboardButton(text="❌ Remove Admin", callback_data="admin_remove")
+            InlineKeyboardButton(text="🔵 Add Admin", callback_data="admin_add"),
+            InlineKeyboardButton(text="🔴 Remove Admin", callback_data="admin_remove")
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+# Colorful "Premium-style" Selection Panel
 def pack_type_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🖼 Standard Sticker Pack", callback_data="type_regular")],
-        [InlineKeyboardButton(text="🌟 Premium Custom Emoji Pack", callback_data="type_custom_emoji")]
+        [InlineKeyboardButton(text="🟦 Standard Sticker Pack", callback_data="type_regular")],
+        [InlineKeyboardButton(text="🟪 Premium Custom Emoji Pack", callback_data="type_custom_emoji")]
     ])
 
-# --- COMMANDS ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await init_user(message.from_user.id, message.from_user.username)
@@ -105,7 +102,6 @@ async def cmd_panel(message: types.Message, state: FSMContext):
     
     await message.reply("⚙️ **Admin Control Panel**", reply_markup=admin_panel_keyboard(role))
 
-# --- ADMIN PANEL CALLBACKS ---
 @dp.callback_query(F.data.startswith("admin_"))
 async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
     role = await get_role(callback.from_user.id)
@@ -171,7 +167,6 @@ async def broadcast_msg(message: types.Message, state: FSMContext):
 
     await status.edit_text(f"📢 **Broadcast Complete!**\n✅ Sent: `{success}`\n❌ Failed/Blocked: `{failed}`")
 
-# --- CLONER LOGIC ---
 @dp.message(CloneStates.waiting_for_sticker)
 async def process_media(message: types.Message, state: FSMContext):
     if await get_role(message.from_user.id) not in ["admin", "owner"]: return
@@ -224,7 +219,6 @@ async def process_media(message: types.Message, state: FSMContext):
         source_type = "zip"
 
     else:
-        # Extract Emojis
         entities = message.entities or message.caption_entities or []
         custom_emoji_ids = [e.custom_emoji_id for e in entities if e.type == "custom_emoji"]
         if not custom_emoji_ids:
