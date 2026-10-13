@@ -1,29 +1,30 @@
 import asyncio
+import gzip
+import json
+import logging
 import os
 import re
+import shutil
+import tempfile
 import time
 import zipfile
-import tempfile
-import shutil
-import logging
 from pathlib import Path
 from dotenv import load_dotenv
+from PIL import Image, ImageOps
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import (
-    TelegramRetryAfter,
-    TelegramBadRequest,
-    TelegramForbiddenError,
     TelegramAPIError,
+    TelegramBadRequest,
+    TelegramRetryAfter,
+    TelegramForbiddenError,
 )
 from aiogram.types import (
     FSInputFile,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
-    Message,
-    CallbackQuery,
+    InlineKeyboardMarkup,
     InputSticker,
 )
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -34,33 +35,53 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MONGO_URI = os.getenv(
     "MONGO_URI",
-    "mongodb://localhost:27017/"
+    "mongodb://localhost:27017/",
 )
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+DB_NAME = "sticker_bot"
 ADMIN_USERNAMES = {
     "irtzaakash",
     "itzaakash",
 }
-DB_NAME = "sticker_bot"
+# Button styling is supported by compatible Bot API versions.
+BUTTON_STYLES_ENABLED = True
+# Insert actual Telegram custom emoji IDs here.
+# Leave empty to use ordinary Unicode emoji in labels.
+EMOJI_PREMIUM = ""
+EMOJI_STATS = ""
+EMOJI_BROADCAST = ""
+EMOJI_ADMIN = ""
+EMOJI_REMOVE = ""
+EMOJI_STICKER = ""
+EMOJI_CUSTOM = ""
+STYLE_PRIMARY = "primary"
+STYLE_SUCCESS = "success"
+STYLE_DANGER = "danger"
+# Maximum number of files accepted from one ZIP.
+MAX_ZIP_FILES = 200
+MAX_ZIP_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+# Telegram sticker limits.
+STATIC_STICKER_SIZE = 512
+CUSTOM_EMOJI_SIZE = 100
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("elite_creator")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing from your .env file.")
+    raise RuntimeError("BOT_TOKEN is missing from .env")
 if OWNER_ID <= 0:
-    raise RuntimeError("Set your numeric OWNER_ID in .env.")
+    raise RuntimeError("Set your numeric OWNER_ID in .env")
 # ============================================================
 # BOT AND DATABASE
 # ============================================================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-db_client = AsyncIOMotorClient(MONGO_URI)
-db = db_client[DB_NAME]
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+db = mongo_client[DB_NAME]
 users_col = db["users"]
 # ============================================================
-# STATES
+# FSM STATES
 # ============================================================
 class CloneStates(StatesGroup):
     waiting_for_sticker = State()
@@ -72,20 +93,12 @@ class AdminStates(StatesGroup):
     waiting_for_remove_admin = State()
     waiting_for_broadcast = State()
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 def clean_name(value: str) -> str:
-    """Keep only letters and numbers."""
     return re.sub(r"[^a-zA-Z0-9]", "", value or "")
-def make_progress_bar(
-    current: int,
-    total: int,
-    length: int = 15,
-) -> str:
-    if total <= 0:
-        percent = 0
-    else:
-        percent = min(current / total, 1.0)
+def progress_bar(current: int, total: int, length: int = 15) -> str:
+    percent = min(current / total, 1.0) if total else 0.0
     filled = int(length * percent)
     return (
         f"[{'█' * filled}{'░' * (length - filled)}] "
@@ -94,21 +107,20 @@ def make_progress_bar(
 async def init_user(user_id: int, username: str | None):
     user = await users_col.find_one({"user_id": user_id})
     if not user:
-        role = "owner" if user_id == OWNER_ID else "user"
         await users_col.insert_one({
             "user_id": user_id,
             "username": username,
-            "role": role,
+            "role": "owner" if user_id == OWNER_ID else "user",
             "created_at": int(time.time()),
         })
-    else:
-        updates = {"username": username}
-        if user_id == OWNER_ID:
-            updates["role"] = "owner"
-        await users_col.update_one(
-            {"user_id": user_id},
-            {"$set": updates},
-        )
+        return
+    updates = {"username": username}
+    if user_id == OWNER_ID:
+        updates["role"] = "owner"
+    await users_col.update_one(
+        {"user_id": user_id},
+        {"$set": updates},
+    )
 async def get_role(
     user_id: int,
     username: str | None = None,
@@ -119,75 +131,38 @@ async def get_role(
         return "admin"
     user = await users_col.find_one({"user_id": user_id})
     return user.get("role", "user") if user else "user"
-async def is_admin(
-    user_id: int,
-    username: str | None = None,
-) -> bool:
-    return await get_role(user_id, username) in {
-        "owner",
-        "admin",
-    }
-async def ensure_user(message: Message):
+async def allowed(user_id: int, username: str | None = None) -> bool:
+    return await get_role(user_id, username) in {"owner", "admin"}
+async def ensure_user(message: types.Message):
     if message.from_user:
         await init_user(
             message.from_user.id,
             message.from_user.username,
         )
+# ============================================================
+# INLINE BUTTON HELPERS
+# ============================================================
 def make_button(
     text: str,
-    callback_data: str,
+    callback_data: str | None = None,
     style: str | None = None,
     emoji_id: str | None = None,
-) -> InlineKeyboardButton:
-    kwargs = {
-        "text": text,
-        "callback_data": callback_data,
-    }
-    # Supported by sufficiently recent Aiogram/Bot API versions.
-    if style:
+    url: str | None = None,
+):
+    kwargs = {"text": text}
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    if url is not None:
+        kwargs["url"] = url
+    if BUTTON_STYLES_ENABLED and style:
         kwargs["style"] = style
-    # Custom emoji icons are separate from the button label.
     if emoji_id:
         kwargs["icon_custom_emoji_id"] = emoji_id
     return InlineKeyboardButton(**kwargs)
-# ============================================================
-# CUSTOMIZABLE BUTTON SETTINGS
-# ============================================================
-# Set to None if your Bot API/library does not support styles.
-BUTTON_STYLE_ENABLED = True
-# Replace these IDs with valid custom emoji IDs if desired.
-# Leave empty to use ordinary Unicode emoji in button text.
-EMOJI_PREMIUM = ""
-EMOJI_STATS = ""
-EMOJI_BROADCAST = ""
-EMOJI_ADMIN = ""
-EMOJI_REMOVE = ""
-EMOJI_STICKER = ""
-EMOJI_CUSTOM = ""
-STYLE_PRIMARY = "primary"
-STYLE_SUCCESS = "success"
-STYLE_DANGER = "danger"
-def styled_button(
-    text: str,
-    callback_data: str,
-    style: str | None = None,
-    emoji_id: str | None = None,
-):
-    if not BUTTON_STYLE_ENABLED:
-        style = None
-    return make_button(
-        text=text,
-        callback_data=callback_data,
-        style=style,
-        emoji_id=emoji_id,
-    )
-# ============================================================
-# ADMIN PANEL KEYBOARD
-# ============================================================
-def admin_panel_keyboard(role: str):
-    buttons = [
+def admin_keyboard(role: str):
+    rows = [
         [
-            styled_button(
+            make_button(
                 "💎 Premium Stats",
                 "admin_stats",
                 STYLE_PRIMARY,
@@ -195,46 +170,43 @@ def admin_panel_keyboard(role: str):
             )
         ],
         [
-            styled_button(
+            make_button(
                 "📢 Broadcast Message",
                 "admin_broadcast",
                 STYLE_SUCCESS,
                 EMOJI_BROADCAST or None,
             )
         ],
+        [
+            make_button(
+                "🖼 Create Sticker Pack",
+                "menu_create",
+                STYLE_PRIMARY,
+                EMOJI_STICKER or None,
+            )
+        ],
     ]
     if role == "owner":
-        buttons.append([
-            styled_button(
+        rows.append([
+            make_button(
                 "👑 Add VIP Admin",
                 "admin_add",
                 STYLE_SUCCESS,
                 EMOJI_ADMIN or None,
             ),
-            styled_button(
+            make_button(
                 "❌ Revoke VIP",
                 "admin_remove",
                 STYLE_DANGER,
                 EMOJI_REMOVE or None,
             ),
         ])
-    buttons.append([
-        styled_button(
-            "🖼 Create Sticker Pack",
-            "menu_create",
-            STYLE_PRIMARY,
-            EMOJI_STICKER or None,
-        )
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-# ============================================================
-# PACK TYPE KEYBOARD
-# ============================================================
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 def pack_type_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                styled_button(
+                make_button(
                     "🖼 Standard Sticker Pack",
                     "type_regular",
                     STYLE_SUCCESS,
@@ -242,7 +214,7 @@ def pack_type_keyboard():
                 )
             ],
             [
-                styled_button(
+                make_button(
                     "💎 Custom Emoji Pack",
                     "type_custom_emoji",
                     STYLE_PRIMARY,
@@ -255,7 +227,7 @@ def cancel_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                styled_button(
+                make_button(
                     "❌ Cancel",
                     "cancel_operation",
                     STYLE_DANGER,
@@ -264,11 +236,352 @@ def cancel_keyboard():
         ]
     )
 # ============================================================
-# START COMMAND
+# IMAGE CONVERSION
+# ============================================================
+def convert_image(
+    input_path: str,
+    output_dir: str,
+    custom_emoji: bool = False,
+) -> str:
+    """
+    Convert a static image into a transparent WebP.
+    Standard sticker:
+        512 x 512 maximum canvas.
+    Custom emoji:
+        100 x 100 canvas.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    target = (
+        CUSTOM_EMOJI_SIZE
+        if custom_emoji
+        else STATIC_STICKER_SIZE
+    )
+    output_path = os.path.join(
+        output_dir,
+        f"converted_{time.time_ns()}.webp",
+    )
+    with Image.open(input_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+        image.thumbnail(
+            (target, target),
+            Image.Resampling.LANCZOS,
+        )
+        canvas = Image.new(
+            "RGBA",
+            (target, target),
+            (0, 0, 0, 0),
+        )
+        x = (target - image.width) // 2
+        y = (target - image.height) // 2
+        canvas.alpha_composite(image, (x, y))
+        canvas.save(
+            output_path,
+            "WEBP",
+            lossless=True,
+            method=6,
+        )
+    if os.path.getsize(output_path) > 512 * 1024:
+        # Re-encode with lossy compression if necessary.
+        with Image.open(output_path) as image:
+            image.save(
+                output_path,
+                "WEBP",
+                quality=80,
+                method=6,
+            )
+    if os.path.getsize(output_path) > 512 * 1024:
+        raise ValueError(
+            "The converted image exceeds Telegram's static sticker "
+            "file-size limit."
+        )
+    return output_path
+# ============================================================
+# TGS VALIDATION
+# ============================================================
+def validate_tgs(
+    path: str,
+    custom_emoji: bool = False,
+):
+    """
+    Check that a TGS file is valid and has the expected canvas.
+    This does not resize or reanimate TGS files.
+    """
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as file:
+            data = json.load(file)
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid TGS animation: {exc}"
+        ) from exc
+    width = data.get("w")
+    height = data.get("h")
+    if not isinstance(width, (int, float)):
+        raise ValueError("TGS animation has no valid width.")
+    if not isinstance(height, (int, float)):
+        raise ValueError("TGS animation has no valid height.")
+    expected = CUSTOM_EMOJI_SIZE if custom_emoji else STATIC_STICKER_SIZE
+    if width != expected or height != expected:
+        raise ValueError(
+            f"TGS canvas is {width}x{height}, but this destination "
+            f"requires {expected}x{expected}. TGS files are not "
+            "automatically resized because that can distort animation."
+        )
+    if os.path.getsize(path) > 64 * 1024:
+        raise ValueError(
+            "TGS file exceeds Telegram's 64 KB animation limit."
+        )
+# ============================================================
+# VIDEO CONVERSION
+# ============================================================
+async def convert_video(
+    input_path: str,
+    output_dir: str,
+) -> str:
+    """
+    Convert a video into a silent VP9 WebM video sticker.
+    FFmpeg must be installed on the server.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(
+        output_dir,
+        f"video_{time.time_ns()}.webm",
+    )
+    # Scale the longer dimension to 512 and preserve aspect ratio.
+    # Pad to 512x512 so one dimension is exactly 512.
+    video_filter = (
+        "scale=512:512:force_original_aspect_ratio=decrease,"
+        "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+        "setsar=1"
+    )
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-i", input_path,
+        "-t", "3",
+        "-an",
+        "-vf", video_filter,
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "yuva420p",
+        "-b:v", "0",
+        "-crf", "35",
+        "-deadline", "good",
+        "-cpu-used", "4",
+        "-metadata:s:v:0", "alpha_mode=1",
+        output_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise ValueError(
+            "FFmpeg could not convert the video: "
+            + stderr.decode(errors="replace")[:800]
+        )
+    if not os.path.exists(output_path):
+        raise ValueError("FFmpeg did not produce a WebM file.")
+    if os.path.getsize(output_path) > 256 * 1024:
+        raise ValueError(
+            "Converted video exceeds Telegram's video sticker size limit. "
+            "Try a shorter or simpler video."
+        )
+    return output_path
+# ============================================================
+# ZIP HANDLING
+# ============================================================
+def safe_extract_zip(zip_path: str, destination: str):
+    """
+    Safely extract a ZIP with file-count and size limits.
+    """
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        entries = archive.infolist()
+        if len(entries) > MAX_ZIP_FILES:
+            raise ValueError(
+                f"ZIP contains too many files. Maximum: {MAX_ZIP_FILES}."
+            )
+        total_size = sum(item.file_size for item in entries)
+        if total_size > MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                "ZIP is too large after extraction."
+            )
+        root = os.path.realpath(destination)
+        for item in entries:
+            target = os.path.realpath(
+                os.path.join(destination, item.filename)
+            )
+            if not target.startswith(root + os.sep) and target != root:
+                raise ValueError(
+                    "ZIP contains an unsafe file path."
+                )
+        archive.extractall(destination)
+def find_media_files(directory: str):
+    supported = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".tgs",
+        ".webm",
+        ".mp4",
+    }
+    result = []
+    for root, _, files in os.walk(directory):
+        for filename in files:
+            if filename.lower() == "stickers.zip":
+                continue
+            if Path(filename).suffix.lower() in supported:
+                result.append(
+                    os.path.join(root, filename)
+                )
+    return sorted(result)
+# ============================================================
+# SOURCE PREPARATION
+# ============================================================
+async def prepare_source(
+    message: types.Message,
+    state: FSMContext,
+):
+    """
+    Accept:
+    1. A sticker from an existing set.
+    2. A ZIP of static, animated, or video files.
+    3. A message containing custom emojis.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="elite_creator_")
+    try:
+        if message.sticker:
+            sticker = message.sticker
+            if not sticker.set_name:
+                raise ValueError(
+                    "This sticker does not belong to a sticker set."
+                )
+            sticker_set = await bot.get_sticker_set(
+                name=sticker.set_name
+            )
+            stickers = sticker_set.stickers
+            if not stickers:
+                raise ValueError("The sticker set is empty.")
+            formats = {
+                "video" if item.is_video
+                else "animated" if item.is_animated
+                else "static"
+                for item in stickers
+            }
+            if len(formats) != 1:
+                raise ValueError(
+                    "The source pack contains mixed formats. "
+                    "Select a single-format pack."
+                )
+            sticker_format = formats.pop()
+            await state.update_data(
+                original_stickers=stickers,
+                source_type="pack",
+                sticker_format=sticker_format,
+                temp_dir=temp_dir,
+            )
+            return len(stickers), sticker_format
+        if (
+            message.document
+            and message.document.file_name
+            and message.document.file_name.lower().endswith(".zip")
+        ):
+            zip_path = os.path.join(
+                temp_dir,
+                "stickers.zip",
+            )
+            await bot.download(
+                message.document,
+                destination=zip_path,
+            )
+            safe_extract_zip(zip_path, temp_dir)
+            paths = find_media_files(temp_dir)
+            if not paths:
+                raise ValueError(
+                    "ZIP contains no supported sticker files."
+                )
+            # Infer the format of each item.
+            extensions = {
+                Path(path).suffix.lower()
+                for path in paths
+            }
+            has_video = any(
+                ext in {".mp4", ".webm"}
+                for ext in extensions
+            )
+            has_animation = ".tgs" in extensions
+            has_static = any(
+                ext in {".png", ".jpg", ".jpeg", ".webp"}
+                for ext in extensions
+            )
+            if sum([has_video, has_animation, has_static]) != 1:
+                raise ValueError(
+                    "Your ZIP mixes static, animated, or video files. "
+                    "Please create one ZIP for each format."
+                )
+            sticker_format = (
+                "video" if has_video
+                else "animated" if has_animation
+                else "static"
+            )
+            await state.update_data(
+                original_stickers=paths,
+                source_type="zip",
+                sticker_format=sticker_format,
+                temp_dir=temp_dir,
+            )
+            return len(paths), sticker_format
+        # Extract custom emoji IDs from message or caption entities.
+        entities = (
+            message.entities or []
+        ) + (
+            message.caption_entities or []
+        )
+        custom_ids = list(dict.fromkeys(
+            entity.custom_emoji_id
+            for entity in entities
+            if entity.type == "custom_emoji"
+            and entity.custom_emoji_id
+        ))
+        if not custom_ids:
+            raise ValueError(
+                "No source found. Send a sticker, a custom emoji "
+                "message, or a ZIP file."
+            )
+        stickers = await bot.get_custom_emoji_stickers(
+            custom_emoji_ids=custom_ids
+        )
+        if not stickers:
+            raise ValueError(
+                "Telegram returned no custom emoji stickers."
+            )
+        formats = {
+            "video" if item.is_video
+            else "animated" if item.is_animated
+            else "static"
+            for item in stickers
+        }
+        if len(formats) != 1:
+            raise ValueError(
+                "The selected custom emojis use mixed formats."
+            )
+        sticker_format = formats.pop()
+        await state.update_data(
+            original_stickers=stickers,
+            source_type="custom_emoji",
+            sticker_format=sticker_format,
+            temp_dir=temp_dir,
+        )
+        return len(stickers), sticker_format
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+# ============================================================
+# START
 # ============================================================
 @dp.message(Command("start"))
 async def cmd_start(
-    message: Message,
+    message: types.Message,
     state: FSMContext,
 ):
     await ensure_user(message)
@@ -278,25 +591,27 @@ async def cmd_start(
     )
     if role not in {"owner", "admin"}:
         await message.answer(
-            "🚫 Access denied.\n"
-            "This bot is available to authorized administrators only."
+            "🚫 Access denied. This is a private bot."
         )
         return
-    await state.set_state(CloneStates.waiting_for_sticker)
+    await state.clear()
     await message.answer(
         "✨ ELITE CREATOR\n\n"
-        "Welcome to the sticker-pack creator.\n\n"
-        "1. Send or forward a sticker from a pack.\n"
-        "2. Send a message containing custom emoji.\n"
-        "3. Upload a ZIP containing sticker files.\n\n"
-        "Choose an action from the panel.",
-        reply_markup=admin_panel_keyboard(role),
+        "Create your sticker or custom emoji pack.\n\n"
+        "Supported sources:\n"
+        "• Existing sticker packs\n"
+        "• PNG/JPG/WebP images\n"
+        "• TGS animated stickers\n"
+        "• WebM/MP4 video files\n"
+        "• Custom emoji messages\n\n"
+        "Choose an action below.",
+        reply_markup=admin_keyboard(role),
     )
 # ============================================================
-# ADMIN PANEL COMMAND
+# ADMIN PANEL
 # ============================================================
 @dp.message(Command("panel", "admin"))
-async def cmd_panel(message: Message):
+async def cmd_panel(message: types.Message):
     await ensure_user(message)
     role = await get_role(
         message.from_user.id,
@@ -307,14 +622,14 @@ async def cmd_panel(message: Message):
         return
     await message.answer(
         "💎 ELITE ADMIN PANEL",
-        reply_markup=admin_panel_keyboard(role),
+        reply_markup=admin_keyboard(role),
     )
 # ============================================================
-# CANCEL COMMAND
+# CANCEL
 # ============================================================
 @dp.message(Command("cancel"))
-async def cmd_cancel(
-    message: Message,
+async def cancel_command(
+    message: types.Message,
     state: FSMContext,
 ):
     data = await state.get_data()
@@ -322,12 +637,10 @@ async def cmd_cancel(
     if temp_dir:
         shutil.rmtree(temp_dir, ignore_errors=True)
     await state.clear()
-    await message.answer(
-        "❌ Operation cancelled."
-    )
+    await message.answer("❌ Operation cancelled.")
 @dp.callback_query(F.data == "cancel_operation")
 async def cancel_callback(
-    callback: CallbackQuery,
+    callback: types.CallbackQuery,
     state: FSMContext,
 ):
     data = await state.get_data()
@@ -336,7 +649,7 @@ async def cancel_callback(
         shutil.rmtree(temp_dir, ignore_errors=True)
     await state.clear()
     await callback.answer("Cancelled.")
-    await callback.message.edit_text(
+    await callback.message.answer(
         "❌ Operation cancelled."
     )
 # ============================================================
@@ -344,13 +657,9 @@ async def cancel_callback(
 # ============================================================
 @dp.callback_query(F.data.startswith("admin_"))
 async def admin_callbacks(
-    callback: CallbackQuery,
+    callback: types.CallbackQuery,
     state: FSMContext,
 ):
-    await init_user(
-        callback.from_user.id,
-        callback.from_user.username,
-    )
     role = await get_role(
         callback.from_user.id,
         callback.from_user.username,
@@ -363,25 +672,24 @@ async def admin_callbacks(
         return
     action = callback.data.removeprefix("admin_")
     if action == "stats":
-        total_users = await users_col.count_documents({})
+        total = await users_col.count_documents({})
         admins = await users_col.count_documents({
             "role": "admin",
         })
-        await callback.message.edit_text(
+        await callback.message.answer(
             "💎 PREMIUM STATISTICS\n\n"
-            f"👥 Total registered users: {total_users}\n"
-            f"👑 VIP admins: {admins}\n"
-            f"🛡 Current role: {role.title()}",
-            reply_markup=admin_panel_keyboard(role),
+            f"👥 Registered users: {total}\n"
+            f"👑 VIP admins: {admins}",
+            reply_markup=admin_keyboard(role),
         )
     elif action == "broadcast":
         await state.set_state(
             AdminStates.waiting_for_broadcast
         )
         await callback.message.answer(
-            "📢 Send the message to broadcast.\n\n"
-            "Supported: text, photo, video and other "
-            "messages Telegram allows the bot to copy.\n\n"
+            "📢 Send the message you want to broadcast.\n"
+            "Text, photos, videos and other copyable messages "
+            "are supported.\n\n"
             "Use /cancel to stop.",
             reply_markup=cancel_keyboard(),
         )
@@ -390,8 +698,7 @@ async def admin_callbacks(
             AdminStates.waiting_for_new_admin
         )
         await callback.message.answer(
-            "👑 Send the numeric Telegram user ID "
-            "to promote to VIP admin.",
+            "👑 Send the numeric user ID to promote.",
             reply_markup=cancel_keyboard(),
         )
     elif action == "remove" and role == "owner":
@@ -399,23 +706,16 @@ async def admin_callbacks(
             AdminStates.waiting_for_remove_admin
         )
         await callback.message.answer(
-            "❌ Send the numeric user ID to revoke "
-            "VIP admin access.",
+            "❌ Send the numeric user ID to demote.",
             reply_markup=cancel_keyboard(),
         )
-    else:
-        await callback.answer(
-            "You cannot perform this action.",
-            show_alert=True,
-        )
-        return
     await callback.answer()
 # ============================================================
-# ADD ADMIN
+# ADD VIP ADMIN
 # ============================================================
 @dp.message(AdminStates.waiting_for_new_admin, F.text)
 async def add_admin(
-    message: Message,
+    message: types.Message,
     state: FSMContext,
 ):
     if message.from_user.id != OWNER_ID:
@@ -431,7 +731,6 @@ async def add_admin(
             {
                 "$set": {"role": "admin"},
                 "$setOnInsert": {
-                    "user_id": target_id,
                     "username": None,
                     "created_at": int(time.time()),
                 },
@@ -443,15 +742,15 @@ async def add_admin(
         )
     except ValueError:
         await message.answer(
-            "❌ Invalid ID. Send a numeric Telegram user ID."
+            "❌ Enter a valid numeric Telegram user ID."
         )
     await state.clear()
 # ============================================================
-# REMOVE ADMIN
+# REMOVE VIP ADMIN
 # ============================================================
 @dp.message(AdminStates.waiting_for_remove_admin, F.text)
 async def remove_admin(
-    message: Message,
+    message: types.Message,
     state: FSMContext,
 ):
     if message.from_user.id != OWNER_ID:
@@ -475,16 +774,14 @@ async def remove_admin(
                 f"❌ User {target_id} has been demoted."
             )
     except ValueError:
-        await message.answer(
-            "❌ Invalid ID. Send a numeric Telegram user ID."
-        )
+        await message.answer("❌ Invalid user ID.")
     await state.clear()
 # ============================================================
 # BROADCAST
 # ============================================================
 @dp.message(AdminStates.waiting_for_broadcast)
-async def broadcast_msg(
-    message: Message,
+async def broadcast_message(
+    message: types.Message,
     state: FSMContext,
 ):
     role = await get_role(
@@ -494,10 +791,6 @@ async def broadcast_msg(
     if role not in {"owner", "admin"}:
         await state.clear()
         await message.answer("🚫 Access denied.")
-        return
-    if message.text and message.text.startswith("/cancel"):
-        await state.clear()
-        await message.answer("❌ Broadcast cancelled.")
         return
     await state.clear()
     status = await message.answer(
@@ -520,7 +813,6 @@ async def broadcast_msg(
                 message_id=message.message_id,
             )
             success += 1
-            await asyncio.sleep(0.05)
         except TelegramRetryAfter as exc:
             await asyncio.sleep(exc.retry_after + 1)
             try:
@@ -532,19 +824,22 @@ async def broadcast_msg(
                 success += 1
             except Exception:
                 failed += 1
-        except Exception:
+        except TelegramForbiddenError:
             failed += 1
+        except TelegramAPIError:
+            failed += 1
+        await asyncio.sleep(0.05)
     await status.edit_text(
         "📢 BROADCAST COMPLETE\n\n"
         f"✅ Sent: {success}\n"
         f"❌ Failed: {failed}"
     )
 # ============================================================
-# CREATE PACK BUTTON
+# START CREATION
 # ============================================================
 @dp.callback_query(F.data == "menu_create")
-async def create_menu_callback(
-    callback: CallbackQuery,
+async def menu_create(
+    callback: types.CallbackQuery,
     state: FSMContext,
 ):
     role = await get_role(
@@ -557,20 +852,21 @@ async def create_menu_callback(
             show_alert=True,
         )
         return
+    await state.clear()
     await state.set_state(
         CloneStates.waiting_for_sticker
     )
     await callback.message.answer(
-        "📦 Send a sticker, a message containing "
-        "custom emoji, or a ZIP file."
+        "📦 Send a sticker, custom emoji message, "
+        "or ZIP file containing sticker media."
     )
     await callback.answer()
 # ============================================================
-# COLLECT SOURCE STICKERS
+# PROCESS SOURCE
 # ============================================================
 @dp.message(CloneStates.waiting_for_sticker)
-async def process_media(
-    message: Message,
+async def process_source(
+    message: types.Message,
     state: FSMContext,
 ):
     role = await get_role(
@@ -579,192 +875,37 @@ async def process_media(
     )
     if role not in {"owner", "admin"}:
         return
-    wait_msg = await message.answer(
-        "🔍 Processing source..."
+    status = await message.answer(
+        "🔍 Inspecting source..."
     )
-    original_stickers = []
-    sticker_format = "static"
-    source_type = "pack"
-    temp_dir = None
-    # --------------------------------------------------------
-    # SOURCE 1: FORWARDED OR SENT STICKER
-    # --------------------------------------------------------
-    if message.sticker:
-        sticker = message.sticker
-        if not sticker.set_name:
-            await wait_msg.edit_text(
-                "❌ This sticker does not belong to a sticker set."
-            )
-            return
-        try:
-            sticker_set = await bot.get_sticker_set(
-                name=sticker.set_name
-            )
-            original_stickers = sticker_set.stickers
-            sticker_format = (
-                "video" if sticker.is_video
-                else "animated" if sticker.is_animated
-                else "static"
-            )
-        except TelegramAPIError as exc:
-            await wait_msg.edit_text(
-                f"❌ Could not fetch sticker pack: {exc}"
-            )
-            return
-    # --------------------------------------------------------
-    # SOURCE 2: ZIP FILE
-    # --------------------------------------------------------
-    elif (
-        message.document
-        and message.document.file_name
-        and message.document.file_name.lower().endswith(".zip")
-    ):
-        temp_dir = tempfile.mkdtemp(prefix="elite_creator_")
-        zip_path = os.path.join(
-            temp_dir,
-            "stickers.zip",
+    try:
+        count, sticker_format = await prepare_source(
+            message,
+            state,
         )
-        try:
-            await bot.download(
-                message.document,
-                destination=zip_path,
-            )
-            valid_files = []
-            with zipfile.ZipFile(zip_path, "r") as archive:
-                # Prevent path traversal from malicious ZIP entries.
-                for item in archive.infolist():
-                    if item.is_dir():
-                        continue
-                    target = os.path.realpath(
-                        os.path.join(temp_dir, item.filename)
-                    )
-                    if not (
-                        target == os.path.realpath(temp_dir)
-                        or target.startswith(
-                            os.path.realpath(temp_dir) + os.sep
-                        )
-                    ):
-                        raise ValueError(
-                            "ZIP contains an unsafe file path."
-                        )
-                archive.extractall(temp_dir)
-            for root, _, files in os.walk(temp_dir):
-                for filename in files:
-                    if filename == "stickers.zip":
-                        continue
-                    if filename.lower().endswith(
-                        (".webp", ".tgs", ".webm")
-                    ):
-                        valid_files.append(
-                            os.path.join(root, filename)
-                        )
-            valid_files.sort()
-            if not valid_files:
-                await wait_msg.edit_text(
-                    "❌ ZIP contains no .webp, .tgs or .webm files."
-                )
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return
-            extensions = {
-                Path(path).suffix.lower()
-                for path in valid_files
-            }
-            # A single Telegram sticker set cannot mix formats.
-            if len(extensions) != 1:
-                await wait_msg.edit_text(
-                    "❌ Your ZIP contains mixed sticker formats.\n\n"
-                    "Create separate ZIPs for:\n"
-                    "• .webp static stickers\n"
-                    "• .tgs animated stickers\n"
-                    "• .webm video stickers"
-                )
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return
-            extension = next(iter(extensions))
-            sticker_format = {
-                ".webp": "static",
-                ".tgs": "animated",
-                ".webm": "video",
-            }[extension]
-            original_stickers = valid_files
-            source_type = "zip"
-        except Exception as exc:
-            await wait_msg.edit_text(
-                f"❌ Could not read ZIP: {exc}"
-            )
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            return
-    # --------------------------------------------------------
-    # SOURCE 3: CUSTOM EMOJI IN MESSAGE
-    # --------------------------------------------------------
-    else:
-        entities = (
-            message.entities or []
-        ) + (
-            message.caption_entities or []
+        await status.edit_text(
+            "📦 SOURCE READY\n\n"
+            f"📊 Items: {count}\n"
+            f"🎨 Format: {sticker_format.title()}\n\n"
+            "Choose the destination pack type.",
+            reply_markup=pack_type_keyboard(),
         )
-        custom_emoji_ids = list(dict.fromkeys(
-            entity.custom_emoji_id
-            for entity in entities
-            if entity.type == "custom_emoji"
-            and entity.custom_emoji_id
-        ))
-        if not custom_emoji_ids:
-            await wait_msg.edit_text(
-                "❌ No source found.\n\n"
-                "Send a sticker, a custom emoji message, "
-                "or a ZIP file."
-            )
-            return
-        try:
-            stickers = await bot.get_custom_emoji_stickers(
-                custom_emoji_ids=custom_emoji_ids
-            )
-            original_stickers = stickers
-            source_type = "custom_emoji"
-            first = stickers[0]
-            sticker_format = (
-                "video" if first.is_video
-                else "animated" if first.is_animated
-                else "static"
-            )
-        except TelegramAPIError as exc:
-            await wait_msg.edit_text(
-                f"❌ Could not retrieve custom emojis: {exc}"
-            )
-            return
-    if not original_stickers:
-        await wait_msg.edit_text(
-            "❌ No stickers were found."
+        await state.set_state(
+            CloneStates.waiting_for_pack_type
         )
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        return
-    await state.update_data(
-        original_stickers=original_stickers,
-        sticker_format=sticker_format,
-        source_type=source_type,
-        temp_dir=temp_dir,
-    )
-    await wait_msg.edit_text(
-        "📦 SOURCE READY\n\n"
-        f"📊 Items found: {len(original_stickers)}\n"
-        f"🎨 Format: {sticker_format.title()}\n\n"
-        "Choose the destination pack type:",
-        reply_markup=pack_type_keyboard(),
-    )
-    await state.set_state(
-        CloneStates.waiting_for_pack_type
-    )
+    except Exception as exc:
+        await status.edit_text(
+            f"❌ Source error:\n{str(exc)[:1200]}"
+        )
 # ============================================================
-# CHOOSE PACK TYPE
+# SELECT PACK TYPE
 # ============================================================
 @dp.callback_query(
     CloneStates.waiting_for_pack_type,
     F.data.startswith("type_"),
 )
-async def process_pack_type(
-    callback: CallbackQuery,
+async def select_pack_type(
+    callback: types.CallbackQuery,
     state: FSMContext,
 ):
     role = await get_role(
@@ -785,31 +926,30 @@ async def process_pack_type(
     data = await state.get_data()
     source_type = data.get("source_type")
     sticker_format = data.get("sticker_format")
-    if sticker_type == "custom_emoji" and source_type == "zip":
-        # ZIP files do not carry the source emoji entities needed
-        # to reliably map custom emoji files into an emoji pack.
-        await callback.answer(
-            "For emoji packs, send custom emoji directly in a message.",
-            show_alert=True,
-        )
-        return
+    # Video stickers are not accepted as custom emoji.
     if sticker_type == "custom_emoji" and sticker_format == "video":
         await callback.answer(
-            "Video stickers cannot be used as custom emoji.",
+            "Video stickers cannot be used as custom emojis.",
             show_alert=True,
         )
         return
+    # A TGS file must already have the required canvas.
+    if sticker_type == "custom_emoji" and source_type == "zip":
+        if sticker_format == "animated":
+            await callback.answer(
+                "For animated emoji, use TGS files with a 100x100 canvas.",
+                show_alert=True,
+            )
+            return
     await state.update_data(
         sticker_type=sticker_type
     )
-    await callback.message.edit_text(
-        "✅ Pack type selected:\n"
-        f"{'💎 Custom Emoji Pack' if sticker_type == 'custom_emoji' else '🖼 Standard Sticker Pack'}\n\n"
-        "📝 Send a title for the new pack.",
-        reply_markup=cancel_keyboard(),
-    )
     await state.set_state(
         CloneStates.waiting_for_title
+    )
+    await callback.message.answer(
+        "📝 Send the title for your new pack.",
+        reply_markup=cancel_keyboard(),
     )
     await callback.answer()
 # ============================================================
@@ -817,44 +957,152 @@ async def process_pack_type(
 # ============================================================
 @dp.message(CloneStates.waiting_for_title, F.text)
 async def process_title(
-    message: Message,
+    message: types.Message,
     state: FSMContext,
 ):
     title = message.text.strip()
-    if not title:
+    if not title or len(title) > 64:
         await message.answer(
-            "❌ Title cannot be empty."
-        )
-        return
-    if len(title) > 64:
-        await message.answer(
-            "❌ Pack title must be 64 characters or fewer."
+            "❌ Enter a title between 1 and 64 characters."
         )
         return
     await state.update_data(
         new_title=title
     )
-    username = message.from_user.username
-    user_prefix = clean_name(
-        username or str(message.from_user.id)
-    ).lower()
-    await message.answer(
-        "🔗 Send a short link name.\n\n"
-        "Letters and numbers only.\n\n"
-        f"Example: magic\n"
-        f"Your link will resemble:\n"
-        f"{user_prefix}_magic_by_{(await bot.get_me()).username}",
-        reply_markup=cancel_keyboard(),
-    )
     await state.set_state(
         CloneStates.waiting_for_name
     )
+    username = message.from_user.username
+    prefix = clean_name(
+        username or str(message.from_user.id)
+    ).lower()
+    bot_info = await bot.get_me()
+    await message.answer(
+        "🔗 Send a short name for the pack link.\n\n"
+        "Only letters and numbers are allowed.\n\n"
+        f"Example: magic\n"
+        f"Your link will resemble:\n"
+        f"{prefix}_magic_by_{bot_info.username}",
+        reply_markup=cancel_keyboard(),
+    )
 # ============================================================
-# CREATE THE STICKER OR EMOJI PACK
+# PREPARE INPUT STICKERS
+# ============================================================
+async def build_input_stickers(
+    original_stickers,
+    source_type: str,
+    sticker_format: str,
+    sticker_type: str,
+    temp_dir: str,
+):
+    """
+    Prepare valid InputSticker objects.
+    Static images are normalized to WebP.
+    MP4 videos are converted to WebM.
+    TGS files remain animated.
+    """
+    result = []
+    custom_emoji = sticker_type == "custom_emoji"
+    if source_type in {"pack", "custom_emoji"}:
+        for sticker in original_stickers:
+            if custom_emoji and sticker.is_video:
+                raise ValueError(
+                    "Video stickers cannot be used as custom emoji."
+                )
+            if sticker.is_animated and custom_emoji:
+                raise ValueError(
+                    "This animated sticker cannot be safely resized "
+                    "to the required custom emoji canvas. Use a "
+                    "compatible 100x100 TGS file."
+                )
+            if custom_emoji and not sticker.is_animated:
+                downloaded_path = os.path.join(
+                    temp_dir,
+                    f"source_{len(result)}",
+                )
+                await bot.download(
+                    sticker.file_id,
+                    destination=downloaded_path,
+                )
+                converted_path = convert_image(
+                    downloaded_path,
+                    temp_dir,
+                    custom_emoji=True,
+                )
+                result.append(
+                    InputSticker(
+                        sticker=FSInputFile(converted_path),
+                        format="static",
+                        emoji_list=[
+                            getattr(sticker, "emoji", None) or "😀"
+                        ],
+                    )
+                )
+            else:
+                result.append(
+                    InputSticker(
+                        sticker=sticker.file_id,
+                        format=sticker_format,
+                        emoji_list=[
+                            getattr(sticker, "emoji", None) or "😀"
+                        ],
+                    )
+                )
+        return result
+    for index, path in enumerate(original_stickers):
+        extension = Path(path).suffix.lower()
+        if extension in {".png", ".jpg", ".jpeg", ".webp"}:
+            converted_path = convert_image(
+                path,
+                temp_dir,
+                custom_emoji=custom_emoji,
+            )
+            result.append(
+                InputSticker(
+                    sticker=FSInputFile(converted_path),
+                    format="static",
+                    emoji_list=["😀"],
+                )
+            )
+        elif extension == ".tgs":
+            validate_tgs(
+                path,
+                custom_emoji=custom_emoji,
+            )
+            result.append(
+                InputSticker(
+                    sticker=FSInputFile(path),
+                    format="animated",
+                    emoji_list=["😀"],
+                )
+            )
+        elif extension in {".mp4", ".webm"}:
+            if custom_emoji:
+                raise ValueError(
+                    "Video files cannot be used as custom emoji."
+                )
+            converted_path = await convert_video(
+                path,
+                temp_dir,
+            )
+            result.append(
+                InputSticker(
+                    sticker=FSInputFile(converted_path),
+                    format="video",
+                    emoji_list=["😀"],
+                )
+            )
+        else:
+            raise ValueError(
+                f"Unsupported file extension: {extension}"
+            )
+    return result
+# ============================================================
+# CREATE PACK
 # ============================================================
 @dp.message(CloneStates.waiting_for_name, F.text)
-async def process_name(
-    message: Message,
+async def create_pack(
+    message: types.Message,
     state: FSMContext,
 ):
     role = await get_role(
@@ -870,22 +1118,25 @@ async def process_name(
     ).lower()
     if not requested_name:
         await message.answer(
-            "❌ Enter at least one letter or number."
+            "❌ Enter a valid name using letters and numbers."
         )
         return
-    status_msg = await message.answer(
-        "🚀 Preparing your pack..."
+    status = await message.answer(
+        "🚀 Preparing sticker files..."
     )
     started_at = time.time()
     data = await state.get_data()
-    original_stickers = data["original_stickers"]
-    sticker_format = data["sticker_format"]
-    sticker_type = data["sticker_type"]
-    new_title = data["new_title"]
-    source_type = data["source_type"]
+    original_stickers = data.get("original_stickers", [])
+    sticker_format = data.get("sticker_format")
+    sticker_type = data.get("sticker_type")
+    new_title = data.get("new_title")
+    source_type = data.get("source_type")
     temp_dir = data.get("temp_dir")
-    total = len(original_stickers)
     try:
+        if not temp_dir or not os.path.isdir(temp_dir):
+            temp_dir = tempfile.mkdtemp(
+                prefix="elite_creator_"
+            )
         bot_info = await bot.get_me()
         user_prefix = clean_name(
             message.from_user.username
@@ -893,76 +1144,51 @@ async def process_name(
         ).lower()
         if not user_prefix:
             user_prefix = str(message.from_user.id)
-        # Telegram sticker-set names must be unique and end
-        # in _by_<bot_username>.
         suffix = f"_by_{bot_info.username}"
         prefix = f"{user_prefix}_"
-        max_name_length = 64 - len(suffix) - len(prefix)
-        if max_name_length < 1:
+        max_length = 64 - len(prefix) - len(suffix)
+        if max_length < 1:
             raise ValueError(
-                "Bot username or user prefix is too long."
+                "Unable to construct a valid pack name."
             )
-        requested_name = requested_name[:max_name_length]
-        full_short_name = (
+        requested_name = requested_name[:max_length]
+        full_name = (
             f"{prefix}{requested_name}{suffix}"
         )
-        input_stickers = []
-        # ----------------------------------------------------
-        # Build InputSticker objects
-        # ----------------------------------------------------
-        if source_type == "pack":
-            for sticker in original_stickers:
-                emoji = getattr(sticker, "emoji", None) or "😀"
-                input_stickers.append(
-                    InputSticker(
-                        sticker=sticker.file_id,
-                        format=sticker_format,
-                        emoji_list=[emoji],
-                    )
-                )
-        elif source_type == "custom_emoji":
-            for sticker in original_stickers:
-                emoji = getattr(sticker, "emoji", None) or "😀"
-                input_stickers.append(
-                    InputSticker(
-                        sticker=sticker.file_id,
-                        format=sticker_format,
-                        emoji_list=[emoji],
-                    )
-                )
-        elif source_type == "zip":
-            for path in original_stickers:
-                input_stickers.append(
-                    InputSticker(
-                        sticker=FSInputFile(path),
-                        format=sticker_format,
-                        emoji_list=["😀"],
-                    )
-                )
-        if not input_stickers:
-            raise ValueError("No valid stickers to add.")
-        # ----------------------------------------------------
-        # Create pack with first sticker
-        # ----------------------------------------------------
-        await status_msg.edit_text(
-            "📦 Creating sticker pack...\n"
-            f"{make_progress_bar(0, total)}"
-        )
-        await bot.create_new_sticker_set(
-            user_id=message.from_user.id,
-            name=full_short_name,
-            title=new_title,
-            stickers=[input_stickers[0]],
+        input_stickers = await build_input_stickers(
+            original_stickers=original_stickers,
+            source_type=source_type,
             sticker_format=sticker_format,
             sticker_type=sticker_type,
+            temp_dir=temp_dir,
         )
-        added = 1
+        if not input_stickers:
+            raise ValueError("No valid stickers to upload.")
+        total = len(input_stickers)
+        added = 0
         failed = 0
+        await status.edit_text(
+            "📦 Creating sticker pack...\n\n"
+            f"{progress_bar(0, total)}"
+        )
+        # Create the set with the first sticker.
+        while True:
+            try:
+                await bot.create_new_sticker_set(
+                    user_id=message.from_user.id,
+                    name=full_name,
+                    title=new_title,
+                    stickers=[input_stickers[0]],
+                    sticker_format=sticker_format,
+                    sticker_type=sticker_type,
+                )
+                added = 1
+                break
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after + 1)
         last_update = time.time()
-        # ----------------------------------------------------
-        # Add remaining stickers
-        # ----------------------------------------------------
-        for index, sticker_input in enumerate(
+        # Add remaining stickers.
+        for index, sticker in enumerate(
             input_stickers[1:],
             start=2,
         ):
@@ -970,31 +1196,26 @@ async def process_name(
                 try:
                     await bot.add_sticker_to_set(
                         user_id=message.from_user.id,
-                        name=full_short_name,
-                        sticker=sticker_input,
+                        name=full_name,
+                        sticker=sticker,
                     )
                     added += 1
                     break
                 except TelegramRetryAfter as exc:
-                    await asyncio.sleep(
-                        exc.retry_after + 1
-                    )
-                except (
-                    TelegramBadRequest,
-                    TelegramAPIError,
-                ) as exc:
+                    await asyncio.sleep(exc.retry_after + 1)
+                except TelegramBadRequest as exc:
                     failed += 1
                     logger.warning(
-                        "Failed to add sticker %s: %s",
+                        "Sticker %s rejected: %s",
                         index,
                         exc,
                     )
                     break
             if time.time() - last_update >= 2:
                 try:
-                    await status_msg.edit_text(
-                        "⚡ BUILDING YOUR PACK\n\n"
-                        f"{make_progress_bar(index, total)}\n\n"
+                    await status.edit_text(
+                        "⚡ CREATING PACK\n\n"
+                        f"{progress_bar(index, total)}\n\n"
                         f"📊 Processed: {index}/{total}\n"
                         f"✅ Added: {added}\n"
                         f"❌ Failed: {failed}"
@@ -1004,27 +1225,31 @@ async def process_name(
                 last_update = time.time()
             await asyncio.sleep(0.15)
         elapsed = int(time.time() - started_at)
-        pack_link = (
-            f"https://t.me/addstickers/{full_short_name}"
+        pack_url = (
+            f"https://t.me/addstickers/{full_name}"
+        )
+        # Store link in MongoDB so the button continues to work
+        # after the FSM state is cleared.
+        await users_col.update_one(
+            {"user_id": message.from_user.id},
+            {
+                "$set": {
+                    "last_pack_url": pack_url,
+                    "last_pack_name": full_name,
+                }
+            },
         )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    styled_button(
-                        "💎 Add Pack to Telegram",
-                        "open_pack",
-                        STYLE_SUCCESS,
+                    make_button(
+                        "💎 Open Pack",
+                        url=pack_url,
+                        style=STYLE_SUCCESS,
                     )
                 ],
                 [
-                    styled_button(
-                        "🔗 Open Pack Link",
-                        "open_pack",
-                        STYLE_PRIMARY,
-                    )
-                ],
-                [
-                    styled_button(
+                    make_button(
                         "🏠 Admin Panel",
                         "back_panel",
                         STYLE_PRIMARY,
@@ -1032,83 +1257,36 @@ async def process_name(
                 ],
             ]
         )
-        # The URL is included as ordinary text so the user
-        # can copy it even when callback buttons are used.
-        await status_msg.edit_text(
+        await status.edit_text(
             "🎉 PACK CREATION COMPLETE!\n\n"
             f"📦 Title: {new_title}\n"
             f"📊 Source items: {total}\n"
             f"✅ Successfully added: {added}\n"
             f"❌ Failed: {failed}\n"
-            f"⏱ Time: {elapsed} seconds\n\n"
-            "👇 Your pack link:\n"
-            f"{pack_link}",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        styled_button(
-                            "💎 Open Sticker Pack",
-                            "open_pack",
-                            STYLE_SUCCESS,
-                        )
-                    ],
-                    [
-                        styled_button(
-                            "🏠 Admin Panel",
-                            "back_panel",
-                            STYLE_PRIMARY,
-                        )
-                    ],
-                ]
-            ),
+            f"⏱ Time: {elapsed}s\n\n"
+            f"🔗 {pack_url}",
+            reply_markup=keyboard,
             disable_web_page_preview=True,
-        )
-        # Save the pack URL for the callback button.
-        await state.update_data(
-            last_pack_url=pack_link
         )
     except Exception as exc:
         logger.exception("Pack creation failed")
-        await status_msg.edit_text(
+        await status.edit_text(
             "❌ PACK CREATION FAILED\n\n"
-            f"Reason: {str(exc)[:1500]}"
+            f"{str(exc)[:1500]}"
         )
     finally:
-        if source_type == "zip" and temp_dir:
+        if temp_dir:
             shutil.rmtree(
                 temp_dir,
                 ignore_errors=True,
             )
         await state.clear()
 # ============================================================
-# OPEN PACK CALLBACK
-# ============================================================
-@dp.callback_query(F.data == "open_pack")
-async def open_pack_callback(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    # Telegram inline keyboard callback buttons cannot directly
-    # open a URL. Answer with the link in a message.
-    data = await state.get_data()
-    pack_url = data.get("last_pack_url")
-    if pack_url:
-        await callback.message.answer(
-            f"🔗 Your sticker pack:\n{pack_url}"
-        )
-    else:
-        await callback.answer(
-            "Create a pack first.",
-            show_alert=True,
-        )
-        return
-    await callback.answer()
-# ============================================================
-# BACK TO ADMIN PANEL
+# BACK TO PANEL
 # ============================================================
 @dp.callback_query(F.data == "back_panel")
-async def back_panel_callback(
-    callback: CallbackQuery,
+async def back_panel(
+    callback: types.CallbackQuery,
 ):
     role = await get_role(
         callback.from_user.id,
@@ -1122,14 +1300,14 @@ async def back_panel_callback(
         return
     await callback.message.answer(
         "💎 ELITE ADMIN PANEL",
-        reply_markup=admin_panel_keyboard(role),
+        reply_markup=admin_keyboard(role),
     )
     await callback.answer()
 # ============================================================
-# FALLBACK HANDLER
+# FALLBACK
 # ============================================================
 @dp.message()
-async def fallback_handler(message: Message):
+async def fallback(message: types.Message):
     role = await get_role(
         message.from_user.id,
         message.from_user.username,
@@ -1137,19 +1315,41 @@ async def fallback_handler(message: Message):
     if role not in {"owner", "admin"}:
         return
     await message.answer(
-        "✨ Use /start to open the creator menu.\n"
-        "Use /panel to open the admin panel.\n"
-        "Use /cancel to stop an active operation."
+        "✨ Use /start to open the bot menu.\n"
+        "Use /panel for administration.\n"
+        "Use /cancel to stop an operation."
     )
+    
+    @dp.message(Command("emojiid"))
+async def get_emoji_ids(message: types.Message):
+    entities = message.entities or []
+    if message.reply_to_message:
+        entities = (
+            message.reply_to_message.entities or []
+        )
+    found = []
+    for entity in entities:
+        if entity.type == "custom_emoji":
+            found.append(
+                f"Emoji ID: {entity.custom_emoji_id}"
+            )
+    if found:
+        await message.answer(
+            "💎 CUSTOM EMOJI IDs\n\n" + "\n".join(found)
+        )
+    else:
+        await message.answer(
+            "❌ No custom emoji IDs found.\n\n"
+            "Send or reply to a message containing "
+            "actual Telegram custom emojis."
+        )
 # ============================================================
-# STARTUP / SHUTDOWN
+# MAIN
 # ============================================================
 async def main():
-    logger.info(
-        "Elite Creator starting..."
-    )
+    logger.info("Starting Elite Creator...")
     try:
-        await db_client.admin.command("ping")
+        await mongo_client.admin.command("ping")
         logger.info("MongoDB connected.")
     except Exception:
         logger.exception("MongoDB connection failed.")
@@ -1158,6 +1358,6 @@ async def main():
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
-        db_client.close()
+        mongo_client.close()
 if __name__ == "__main__":
     asyncio.run(main())
