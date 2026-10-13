@@ -26,6 +26,8 @@ db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client["sticker_bot"]
 users_col = db["users"]
 
+ADMIN_USERNAMES = ["irtzaakash", "itzaakash"]
+
 class CloneStates(StatesGroup):
     waiting_for_sticker = State()
     waiting_for_pack_type = State()
@@ -45,8 +47,9 @@ async def init_user(user_id: int, username: str):
     elif user_id == OWNER_ID and user.get("role") != "owner":
         await users_col.update_one({"user_id": user_id}, {"$set": {"role": "owner"}})
 
-async def get_role(user_id: int) -> str:
+async def get_role(user_id: int, username: str = None) -> str:
     if user_id == OWNER_ID: return "owner"
+    if username and username.lower() in ADMIN_USERNAMES: return "admin"
     user = await users_col.find_one({"user_id": user_id})
     return user.get("role", "user") if user else "user"
 
@@ -56,72 +59,70 @@ def make_progress_bar(current: int, total: int, length: int = 15) -> str:
     filled = int(length * percent)
     return f"`[{'█' * filled}{'░' * (length - filled)}] {percent:.0%}`"
 
-# Colorful "Premium-style" Admin Panel
+# 💎 Updated Premium Admin Panel
 def admin_panel_keyboard(role: str):
     buttons = [
-        [InlineKeyboardButton(text="🟣 View Bot Statistics", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="🟢 Broadcast Message", callback_data="admin_broadcast")]
+        [InlineKeyboardButton(text="💎 Premium Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Broadcast Message", callback_data="admin_broadcast")]
     ]
     if role == "owner":
         buttons.append([
-            InlineKeyboardButton(text="🔵 Add Admin", callback_data="admin_add"),
-            InlineKeyboardButton(text="🔴 Remove Admin", callback_data="admin_remove")
+            InlineKeyboardButton(text="👑 Add VIP Admin", callback_data="admin_add"),
+            InlineKeyboardButton(text="❌ Revoke VIP", callback_data="admin_remove")
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Colorful "Premium-style" Selection Panel
+# 💎 Updated Pack Selection Menu
 def pack_type_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟦 Standard Sticker Pack", callback_data="type_regular")],
-        [InlineKeyboardButton(text="🟪 Premium Custom Emoji Pack", callback_data="type_custom_emoji")]
+        [InlineKeyboardButton(text="🖼 Standard Sticker Pack", callback_data="type_regular")],
+        [InlineKeyboardButton(text="💎 Premium Custom Emoji Pack", callback_data="type_custom_emoji")]
     ])
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await init_user(message.from_user.id, message.from_user.username)
-    role = await get_role(message.from_user.id)
+    role = await get_role(message.from_user.id, message.from_user.username)
     
     if role not in ["admin", "owner"]:
-        await message.reply("🚫 **Access Denied:** You are not authorized to use this bot.")
+        await message.reply("🚫 **Access Denied:** This is a private bot.")
         return
 
     await message.reply(
-        "👋 **Welcome to the Elite Sticker & Emoji Creator!**\n\n"
+        "✨ **Welcome to the Elite Creator!**\n\n"
         "1️⃣ **Forward me a sticker** to clone a pack.\n"
         "2️⃣ **Send Premium Emojis** to convert them.\n"
-        "3️⃣ **Send a `.zip` file** (`.webm`, `.webp`, `.tgs`) to build a pack.\n\n"
-        "*(You will be asked if you want to create standard stickers or Premium Emojis!)*",
+        "3️⃣ **Send a `.zip` file** (`.webm`, `.webp`, `.tgs`) to build a pack.",
         parse_mode="Markdown"
     )
     await state.set_state(CloneStates.waiting_for_sticker)
 
 @dp.message(Command("panel", "admin"))
 async def cmd_panel(message: types.Message, state: FSMContext):
-    role = await get_role(message.from_user.id)
+    role = await get_role(message.from_user.id, message.from_user.username)
     if role not in ["admin", "owner"]: return
-    
-    await message.reply("⚙️ **Admin Control Panel**", reply_markup=admin_panel_keyboard(role))
+    await message.reply("⚙️ **Settings & VIP Panel**", reply_markup=admin_panel_keyboard(role))
 
 @dp.callback_query(F.data.startswith("admin_"))
 async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
-    role = await get_role(callback.from_user.id)
+    role = await get_role(callback.from_user.id, callback.from_user.username)
     action = callback.data.split("_")[1]
 
     if action == "stats":
         total_users = await users_col.count_documents({})
         admins = await users_col.count_documents({"role": "admin"})
         await callback.message.edit_text(
-            f"📊 **Bot Statistics**\n\n👥 Total Users in DB: `{total_users}`\n🛡 Active Admins: `{admins}`",
+            f"💎 **Premium Statistics**\n\n👥 Total Users: `{total_users}`\n👑 VIP Admins: `{admins}`",
             reply_markup=admin_panel_keyboard(role)
         )
     elif action == "broadcast":
-        await callback.message.reply("📢 Send the message you want to broadcast to all users (Text, Photo, or Video).")
+        await callback.message.reply("📢 Send the message you want to broadcast (Text, Photo, or Video).")
         await state.set_state(AdminStates.waiting_for_broadcast)
     elif action == "add" and role == "owner":
-        await callback.message.reply("✅ Send the numeric User ID to promote them to Admin.")
+        await callback.message.reply("✅ Send the numeric User ID to promote them to VIP Admin.")
         await state.set_state(AdminStates.waiting_for_new_admin)
     elif action == "remove" and role == "owner":
-        await callback.message.reply("❌ Send the numeric User ID to revoke their Admin access.")
+        await callback.message.reply("❌ Send the numeric User ID to revoke their VIP access.")
         await state.set_state(AdminStates.waiting_for_remove_admin)
     
     await callback.answer()
@@ -131,7 +132,7 @@ async def add_admin(message: types.Message, state: FSMContext):
     try:
         target_id = int(message.text.strip())
         await users_col.update_one({"user_id": target_id}, {"$set": {"role": "admin"}}, upsert=True)
-        await message.reply(f"✅ User `{target_id}` is now an Admin.")
+        await message.reply(f"👑 User `{target_id}` is now a VIP Admin.")
     except ValueError:
         await message.reply("❌ Invalid ID. Must be numeric.")
     await state.clear()
@@ -144,7 +145,7 @@ async def remove_admin(message: types.Message, state: FSMContext):
             await message.reply("❌ You cannot remove the Owner.")
         else:
             await users_col.update_one({"user_id": target_id}, {"$set": {"role": "user"}})
-            await message.reply(f"❌ User `{target_id}` has been demoted to regular user.")
+            await message.reply(f"❌ User `{target_id}` has been demoted.")
     except ValueError:
         await message.reply("❌ Invalid ID.")
     await state.clear()
@@ -155,8 +156,7 @@ async def broadcast_msg(message: types.Message, state: FSMContext):
     status = await message.reply("📢 Broadcasting message... ⏳")
     users = await users_col.find({}).to_list(length=None)
     
-    success = 0
-    failed = 0
+    success, failed = 0, 0
     for u in users:
         try:
             await bot.copy_message(chat_id=u["user_id"], from_chat_id=message.chat.id, message_id=message.message_id)
@@ -165,11 +165,11 @@ async def broadcast_msg(message: types.Message, state: FSMContext):
         except Exception:
             failed += 1
 
-    await status.edit_text(f"📢 **Broadcast Complete!**\n✅ Sent: `{success}`\n❌ Failed/Blocked: `{failed}`")
+    await status.edit_text(f"📢 **Broadcast Complete!**\n✅ Sent: `{success}`\n❌ Failed: `{failed}`")
 
 @dp.message(CloneStates.waiting_for_sticker)
 async def process_media(message: types.Message, state: FSMContext):
-    if await get_role(message.from_user.id) not in ["admin", "owner"]: return
+    if await get_role(message.from_user.id, message.from_user.username) not in ["admin", "owner"]: return
 
     wait_msg = await message.reply("🔍 Processing source... ⏳")
     original_stickers = []
@@ -243,8 +243,8 @@ async def process_media(message: types.Message, state: FSMContext):
     await wait_msg.edit_text(
         f"📦 **Source Processed Successfully!**\n"
         f"📊 **Count:** `{len(original_stickers)}`\n"
-        f"⚙️ **Format Detected:** `{sticker_format.title()}`\n\n"
-        f"🤔 **How do you want to create this pack?**",
+        f"⚙️ **Format:** `{sticker_format.title()}`\n\n"
+        f"🤔 **Choose your pack type:**",
         reply_markup=pack_type_keyboard()
     )
     await state.set_state(CloneStates.waiting_for_pack_type)
@@ -255,7 +255,7 @@ async def process_pack_type(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(sticker_type=sticker_type)
     
     await callback.message.edit_text(
-        f"✅ Selected: **{'Premium Custom Emoji' if sticker_type == 'custom_emoji' else 'Standard Sticker'} Pack**\n\n"
+        f"✅ Selected: **{'💎 Premium Custom Emoji' if sticker_type == 'custom_emoji' else '🖼 Standard Sticker'} Pack**\n\n"
         f"📝 **What do you want the Title of your new pack to be?**",
         parse_mode="Markdown"
     )
@@ -340,7 +340,7 @@ async def process_name(message: types.Message, state: FSMContext):
         last_edit_time = time.time()
 
         for st_input in remaining_stickers:
-            if consecutive_fails >= 3: break # Hit hard limit
+            if consecutive_fails >= 3: break 
             added = False
             while not added:
                 try:
