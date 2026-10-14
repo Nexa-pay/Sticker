@@ -213,29 +213,29 @@ def make_button(
 
 def admin_keyboard(role: str):
     rows = [
-        [make_button("💎 Premium Stats", "admin_stats", STYLE_PRIMARY, EMOJI_STATS or None)],
-        [make_button("📢 Broadcast Message", "admin_broadcast", STYLE_SUCCESS, EMOJI_BROADCAST or None)],
-        [make_button("🖼 Create Sticker/Emoji Pack", "menu_create", STYLE_PRIMARY, EMOJI_STICKER or None)],
-        [make_button("💠 Get Custom Emoji ID", "menu_emoji_id", STYLE_PRIMARY, EMOJI_CUSTOM or EMOJI_PREMIUM or None)],
+        [make_button(" Premium Stats", "admin_stats", STYLE_PRIMARY, EMOJI_STATS or None)],
+        [make_button(" Broadcast Message", "admin_broadcast", STYLE_SUCCESS, EMOJI_BROADCAST or None)],
+        [make_button(" Create Sticker/Emoji Pack", "menu_create", STYLE_PRIMARY, EMOJI_STICKER or None)],
+        [make_button(" Get Custom Emoji ID", "menu_emoji_id", STYLE_PRIMARY, EMOJI_CUSTOM or EMOJI_PREMIUM or None)],
     ]
     if role == "owner":
         rows.append([
-            make_button("👑 Add VIP Admin", "admin_add", STYLE_SUCCESS, EMOJI_ADMIN or None),
-            make_button("❌ Revoke VIP", "admin_remove", STYLE_DANGER, EMOJI_REMOVE or None),
+            make_button(" Add VIP Admin", "admin_add", STYLE_SUCCESS, EMOJI_ADMIN or None),
+            make_button(" Revoke VIP", "admin_remove", STYLE_DANGER, EMOJI_REMOVE or None),
         ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def pack_type_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [make_button("🖼 Standard Sticker Pack", "type_regular", STYLE_SUCCESS, EMOJI_STICKER or None)],
-        [make_button("💎 Custom Emoji Pack", "type_custom_emoji", STYLE_PRIMARY, EMOJI_CUSTOM or EMOJI_PREMIUM or None)],
+        [make_button(" Standard Sticker Pack", "type_regular", STYLE_SUCCESS, EMOJI_STICKER or None)],
+        [make_button(" Custom Emoji Pack", "type_custom_emoji", STYLE_PRIMARY, EMOJI_CUSTOM or EMOJI_PREMIUM or None)],
     ])
 
 
 def cancel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [make_button("❌ Cancel", "cancel_operation", STYLE_DANGER)]
+        [make_button(" Cancel", "cancel_operation", STYLE_DANGER)]
     ])
 
 
