@@ -104,16 +104,13 @@ class CloneStates(StatesGroup):
     waiting_for_title = State()
     waiting_for_name = State()
 
-
 class AdminStates(StatesGroup):
     waiting_for_new_admin = State()
     waiting_for_remove_admin = State()
     waiting_for_broadcast = State()
 
-
 class EmojiIDStates(StatesGroup):
     waiting_for_emoji_message = State()
-
 
 # ============================================================
 # GENERAL HELPERS
@@ -122,12 +119,10 @@ def clean_name(value: str) -> str:
     """Remove unsupported characters from a pack-name fragment."""
     return re.sub(r"[^a-zA-Z0-9]", "", value or "")
 
-
 def progress_bar(current: int, total: int, length: int = 15) -> str:
     percent = min(current / total, 1.0) if total else 0.0
     filled = int(length * percent)
     return f"[{'█' * filled}{'░' * (length - filled)}] {percent:.0%}"
-
 
 async def init_user(user_id: int, username: str | None):
     user = await users_col.find_one({"user_id": user_id})
@@ -144,7 +139,6 @@ async def init_user(user_id: int, username: str | None):
         updates["role"] = "owner"
     await users_col.update_one({"user_id": user_id}, {"$set": updates})
 
-
 async def get_role(user_id: int, username: str | None = None) -> str:
     if user_id == OWNER_ID:
         return "owner"
@@ -153,15 +147,12 @@ async def get_role(user_id: int, username: str | None = None) -> str:
     user = await users_col.find_one({"user_id": user_id})
     return user.get("role", "user") if user else "user"
 
-
 async def allowed(user_id: int, username: str | None = None) -> bool:
     return await get_role(user_id, username) in {"owner", "admin"}
-
 
 async def ensure_user(message: types.Message):
     if message.from_user:
         await init_user(message.from_user.id, message.from_user.username)
-
 
 def media_kind_from_sticker(sticker) -> str:
     if getattr(sticker, "is_video", False):
@@ -169,7 +160,6 @@ def media_kind_from_sticker(sticker) -> str:
     if getattr(sticker, "is_animated", False):
         return "animated"
     return "static"
-
 
 def infer_paths_format(paths: list[str]) -> str:
     extensions = {Path(p).suffix.lower() for p in paths}
@@ -182,7 +172,6 @@ def infer_paths_format(paths: list[str]) -> str:
             "or video/GIF files. Please split mixed ZIPs."
         )
     return "video" if has_video else "animated" if has_tgs else "static"
-
 
 # ============================================================
 # INLINE BUTTON HELPERS
@@ -210,7 +199,6 @@ def make_button(
         kwargs.pop("icon_custom_emoji_id", None)
         return InlineKeyboardButton(**kwargs)
 
-
 def admin_keyboard(role: str):
     rows = [
         [make_button(" Premium Stats", "admin_stats", STYLE_PRIMARY, EMOJI_STATS or None)],
@@ -225,34 +213,35 @@ def admin_keyboard(role: str):
         ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def pack_type_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [make_button(" Standard Sticker Pack", "type_regular", STYLE_SUCCESS, EMOJI_STICKER or None)],
         [make_button(" Custom Emoji Pack", "type_custom_emoji", STYLE_PRIMARY, EMOJI_CUSTOM or EMOJI_PREMIUM or None)],
     ])
 
-
 def cancel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [make_button(" Cancel", "cancel_operation", STYLE_DANGER)]
+        [make_button("❌ Cancel", "cancel_operation", STYLE_DANGER)]
     ])
 
-
-def home_keyboard(role: str):
-    return admin_keyboard(role)
-
-
 # ============================================================
-# DOWNLOAD / SOURCE HELPERS
+# BULLETPROOF DOWNLOAD HELPER
 # ============================================================
 async def download_telegram_file(file_id: str, destination: str) -> str:
-    info = await bot.get_file(file_id)
-    if info.file_size and info.file_size > MAX_UPLOAD_BYTES:
-        raise ValueError("Telegram source file is larger than 20 MB.")
-    await bot.download_file(info.file_path, destination=destination)
-    return destination
+    """Smart retrier to prevent Telegram from dropping connections on large packs."""
+    for attempt in range(3):
+        try:
+            await bot.download(file_id, destination=destination)
+            if os.path.exists(destination) and os.path.getsize(destination) > 0:
+                return destination
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 1)
+        except Exception as e:
+            logger.warning(f"Download attempt {attempt + 1} failed: {e}")
+        
+        await asyncio.sleep(1) # Wait 1 second before retrying
 
+    raise ValueError("Failed to download file from Telegram after 3 attempts.")
 
 async def save_message_media(message: types.Message, temp_dir: str) -> tuple[str, str]:
     if message.photo:
@@ -302,7 +291,6 @@ async def save_message_media(message: types.Message, temp_dir: str) -> tuple[str
             return path, "video"
     raise ValueError("Send a sticker, custom emoji message, ZIP file, image, TGS animation, video, or GIF.")
 
-
 # ============================================================
 # IMAGE CONVERSION
 # ============================================================
@@ -332,7 +320,6 @@ def convert_image(input_path: str, output_dir: str, custom_emoji: bool = False) 
         raise ValueError(f"Could not read this image: {exc}") from exc
     return output_path
 
-
 # ============================================================
 # TGS VALIDATION
 # ============================================================
@@ -352,9 +339,8 @@ def validate_tgs(path: str, custom_emoji: bool = False):
     if os.path.getsize(path) > MAX_TGS_BYTES:
         raise ValueError("TGS file exceeds Telegram's 64 KB animation limit.")
 
-
 # ============================================================
-# VIDEO CONVERSION 
+# VIDEO CONVERSION
 # ============================================================
 async def convert_video(input_path: str, output_dir: str, custom_emoji: bool = False) -> str:
     if not shutil.which("ffmpeg"):
@@ -372,12 +358,21 @@ async def convert_video(input_path: str, output_dir: str, custom_emoji: bool = F
     async def encode(crf: int, deadline: str, cpu_used: int, bitrate: str):
         process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", input_path, "-t", "3", "-an", "-sn", "-dn",
-            "-vf", video_filter, "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
-            "-b:v", bitrate, "-crf", str(crf), "-deadline", deadline,
-            "-cpu-used", str(cpu_used), "-auto-alt-ref", "0",
-            "-metadata:s:v:0", "alpha_mode=1", "-f", "webm", output_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "-i", input_path,
+            "-t", "3",
+            "-an", "-sn", "-dn",
+            "-vf", video_filter,
+            "-c:v", "libvpx-vp9",
+            "-pix_fmt", "yuva420p",
+            "-b:v", bitrate,
+            "-crf", str(crf),
+            "-deadline", deadline,
+            "-cpu-used", str(cpu_used),
+            "-auto-alt-ref", "0",
+            "-metadata:s:v:0", "alpha_mode=1",
+            "-f", "webm", output_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         try:
             _, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
@@ -399,7 +394,6 @@ async def convert_video(input_path: str, output_dir: str, custom_emoji: bool = F
         raise ValueError("Converted WebM is still larger than Telegram's 256 KB limit.")
     return output_path
 
-
 # ============================================================
 # ZIP HANDLING
 # ============================================================
@@ -418,17 +412,19 @@ def safe_extract_zip(zip_path: str, destination: str):
                 raise ValueError("ZIP contains an unsafe file path.")
         archive.extractall(destination)
 
-
 def find_media_files(directory: str):
-    supported = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tgs", ".webm", ".mp4", ".mov", ".mkv", ".gif", ".avi", ".m4v", ".mpeg", ".mpg"}
+    supported = {
+        ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tgs",
+        ".webm", ".mp4", ".mov", ".mkv", ".gif", ".avi", ".m4v", ".mpeg", ".mpg",
+    }
     result = []
     for root, _, files in os.walk(directory):
         for filename in files:
-            if filename.lower() == "stickers.zip": continue
+            if filename.lower() == "stickers.zip":
+                continue
             if Path(filename).suffix.lower() in supported:
                 result.append(os.path.join(root, filename))
     return sorted(result)
-
 
 # ============================================================
 # SOURCE PREPARATION
@@ -448,7 +444,12 @@ async def prepare_source(message: types.Message, state: FSMContext):
             if len(formats) != 1:
                 raise ValueError("The source pack contains mixed formats. Select a single-format pack.")
             sticker_format = formats.pop()
-            await state.update_data(original_stickers=stickers, source_type="pack", sticker_format=sticker_format, temp_dir=temp_dir)
+            await state.update_data(
+                original_stickers=stickers,
+                source_type="pack",
+                sticker_format=sticker_format,
+                temp_dir=temp_dir,
+            )
             return len(stickers), sticker_format
 
         if message.document and message.document.file_name and message.document.file_name.lower().endswith(".zip"):
@@ -459,11 +460,20 @@ async def prepare_source(message: types.Message, state: FSMContext):
             if not paths:
                 raise ValueError("ZIP contains no supported sticker files.")
             sticker_format = infer_paths_format(paths)
-            await state.update_data(original_stickers=paths, source_type="zip", sticker_format=sticker_format, temp_dir=temp_dir)
+            await state.update_data(
+                original_stickers=paths,
+                source_type="zip",
+                sticker_format=sticker_format,
+                temp_dir=temp_dir,
+            )
             return len(paths), sticker_format
 
         entities = list(message.entities or []) + list(message.caption_entities or [])
-        custom_ids = list(dict.fromkeys(entity.custom_emoji_id for entity in entities if entity.type == "custom_emoji" and entity.custom_emoji_id))
+        custom_ids = list(dict.fromkeys(
+            entity.custom_emoji_id
+            for entity in entities
+            if entity.type == "custom_emoji" and getattr(entity, "custom_emoji_id", None)
+        ))
         if custom_ids:
             stickers = await bot.get_custom_emoji_stickers(custom_emoji_ids=custom_ids)
             if not stickers:
@@ -472,7 +482,12 @@ async def prepare_source(message: types.Message, state: FSMContext):
             if len(formats) != 1:
                 raise ValueError("Selected custom emojis use mixed formats.")
             sticker_format = formats.pop()
-            await state.update_data(original_stickers=stickers, source_type="custom_emoji", sticker_format=sticker_format, temp_dir=temp_dir)
+            await state.update_data(
+                original_stickers=stickers,
+                source_type="custom_emoji",
+                sticker_format=sticker_format,
+                temp_dir=temp_dir,
+            )
             return len(stickers), sticker_format
 
         path, sticker_format = await save_message_media(message, temp_dir)
@@ -482,16 +497,25 @@ async def prepare_source(message: types.Message, state: FSMContext):
             if not paths:
                 raise ValueError("ZIP contains no supported sticker files.")
             sticker_format = infer_paths_format(paths)
-            await state.update_data(original_stickers=paths, source_type="zip", sticker_format=sticker_format, temp_dir=temp_dir)
+            await state.update_data(
+                original_stickers=paths,
+                source_type="zip",
+                sticker_format=sticker_format,
+                temp_dir=temp_dir,
+            )
             return len(paths), sticker_format
 
-        await state.update_data(original_stickers=[path], source_type="files", sticker_format=sticker_format, temp_dir=temp_dir)
+        await state.update_data(
+            original_stickers=[path],
+            source_type="files",
+            sticker_format=sticker_format,
+            temp_dir=temp_dir,
+        )
         return 1, sticker_format
 
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
-
 
 # ============================================================
 # START
@@ -518,7 +542,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         reply_markup=admin_keyboard(role),
     )
 
-
 # ============================================================
 # ADMIN PANEL
 # ============================================================
@@ -530,7 +553,6 @@ async def cmd_panel(message: types.Message):
         await message.answer("🚫 Access denied.")
         return
     await message.answer("💎 ELITE ADMIN PANEL", reply_markup=admin_keyboard(role))
-
 
 # ============================================================
 # CANCEL
@@ -544,7 +566,6 @@ async def cancel_command(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Operation cancelled.")
 
-
 @dp.callback_query(F.data == "cancel_operation")
 async def cancel_callback(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -554,7 +575,6 @@ async def cancel_callback(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer("Cancelled.")
     await callback.message.answer("❌ Operation cancelled.")
-
 
 # ============================================================
 # CUSTOM EMOJI ID BUTTON + COMMAND
@@ -576,7 +596,6 @@ async def menu_emoji_id(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-
 def extract_custom_emoji_ids(message: types.Message) -> list[str]:
     entities = list(message.entities or []) + list(message.caption_entities or [])
     ids = [
@@ -586,7 +605,6 @@ def extract_custom_emoji_ids(message: types.Message) -> list[str]:
     ]
     return list(dict.fromkeys(ids))
 
-
 @dp.message(EmojiIDStates.waiting_for_emoji_message)
 async def receive_emoji_for_id(message: types.Message, state: FSMContext):
     ids = extract_custom_emoji_ids(message)
@@ -594,7 +612,8 @@ async def receive_emoji_for_id(message: types.Message, state: FSMContext):
     if not ids:
         await message.answer(
             "❌ No Telegram custom emoji ID found.\n\n"
-            "Send the actual custom emoji from Telegram's custom emoji panel.",
+            "Send the actual custom emoji from Telegram's custom emoji panel, "
+            "not a regular Unicode emoji.",
             reply_markup=admin_keyboard(await get_role(message.from_user.id, message.from_user.username)),
         )
         return
@@ -608,7 +627,6 @@ async def receive_emoji_for_id(message: types.Message, state: FSMContext):
         reply_markup=admin_keyboard(await get_role(message.from_user.id, message.from_user.username)),
     )
 
-
 @dp.message(Command("emojiid"))
 async def cmd_emojiid(message: types.Message):
     role = await get_role(message.from_user.id, message.from_user.username)
@@ -617,7 +635,9 @@ async def cmd_emojiid(message: types.Message):
         return
     target = message.reply_to_message
     if target is None:
-        await message.answer("Reply to a message containing Telegram custom emoji(s) with /emojiid.")
+        await message.answer(
+            "Reply to a message containing Telegram custom emoji(s) with /emojiid."
+        )
         return
     ids = extract_custom_emoji_ids(target)
     if not ids:
@@ -625,7 +645,6 @@ async def cmd_emojiid(message: types.Message):
         return
     result = "\n".join(f"{index}. <code>{emoji_id}</code>" for index, emoji_id in enumerate(ids, 1))
     await message.answer(f"💎 <b>Custom Emoji ID(s)</b>\n\n{result}", parse_mode="HTML")
-
 
 # ============================================================
 # ADMIN CALLBACKS
@@ -663,7 +682,6 @@ async def admin_callbacks(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ Send the numeric Telegram user ID to demote.", reply_markup=cancel_keyboard())
     await callback.answer()
 
-
 # ============================================================
 # ADD VIP ADMIN
 # ============================================================
@@ -690,7 +708,6 @@ async def add_admin(message: types.Message, state: FSMContext):
         await message.answer("❌ Enter a valid numeric Telegram user ID.")
     await state.clear()
 
-
 # ============================================================
 # REMOVE VIP ADMIN
 # ============================================================
@@ -713,7 +730,6 @@ async def remove_admin(message: types.Message, state: FSMContext):
         await message.answer("❌ Invalid user ID.")
     await state.clear()
 
-
 # ============================================================
 # BROADCAST
 # ============================================================
@@ -734,12 +750,20 @@ async def broadcast_message(message: types.Message, state: FSMContext):
         if not user_id:
             continue
         try:
-            await bot.copy_message(chat_id=user_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
             success += 1
         except TelegramRetryAfter as exc:
             await asyncio.sleep(exc.retry_after + 1)
             try:
-                await bot.copy_message(chat_id=user_id, from_chat_id=message.chat.id, message_id=message.message_id)
+                await bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
                 success += 1
             except Exception:
                 failed += 1
@@ -748,7 +772,6 @@ async def broadcast_message(message: types.Message, state: FSMContext):
         await asyncio.sleep(0.05)
 
     await status.edit_text(f"📢 BROADCAST COMPLETE\n\n✅ Sent: {success}\n❌ Failed: {failed}")
-
 
 # ============================================================
 # START CREATION
@@ -771,7 +794,6 @@ async def menu_create(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=cancel_keyboard(),
     )
     await callback.answer()
-
 
 # ============================================================
 # PROCESS SOURCE
@@ -797,7 +819,6 @@ async def process_source(message: types.Message, state: FSMContext):
         logger.exception("Source preparation failed")
         await status.edit_text(f"❌ Source error:\n{str(exc)[:1200]}")
 
-
 # ============================================================
 # SELECT PACK TYPE
 # ============================================================
@@ -814,13 +835,14 @@ async def select_pack_type(callback: types.CallbackQuery, state: FSMContext):
     sticker_format = data.get("sticker_format")
 
     if sticker_type == "custom_emoji" and sticker_format == "animated":
-        await callback.answer("TGS animations must already have a 100x100 canvas for custom emoji.", show_alert=True)
-        
+        await callback.answer(
+            "TGS animations must already have a 100x100 canvas for custom emoji.",
+            show_alert=True,
+        )
     await state.update_data(sticker_type=sticker_type)
     await state.set_state(CloneStates.waiting_for_title)
     await callback.message.answer("📝 Send the title for your new pack (1-64 characters).", reply_markup=cancel_keyboard())
     await callback.answer()
-
 
 # ============================================================
 # PACK TITLE
@@ -842,9 +864,8 @@ async def process_title(message: types.Message, state: FSMContext):
         reply_markup=cancel_keyboard(),
     )
 
-
 # ============================================================
-# PREPARE INPUT STICKERS
+# PREPARE INPUT STICKERS (BULLETPROOFED)
 # ============================================================
 async def build_input_stickers(
     original_stickers,
@@ -855,10 +876,12 @@ async def build_input_stickers(
 ):
     result = []
     custom_emoji = sticker_type == "custom_emoji"
+    target = CUSTOM_EMOJI_SIZE if custom_emoji else STATIC_STICKER_SIZE
 
     if source_type in {"pack", "custom_emoji"}:
         for index, sticker in enumerate(original_stickers):
             source_format = media_kind_from_sticker(sticker)
+            
             if source_format == "static":
                 source_path = os.path.join(temp_dir, f"source_{index}.webp")
                 await download_telegram_file(sticker.file_id, source_path)
@@ -886,6 +909,10 @@ async def build_input_stickers(
                     format=StickerFormat.ANIMATED,
                     emoji_list=[getattr(sticker, "emoji", None) or "😀"],
                 ))
+            
+            # CRITICAL FIX: Pacing to prevent Telegram rate-limit silent drops
+            await asyncio.sleep(0.15) 
+            
         return result
 
     for path in original_stickers:
@@ -915,7 +942,6 @@ async def build_input_stickers(
             raise ValueError(f"Unsupported file extension: {extension}")
 
     return result
-
 
 # ============================================================
 # CREATE PACK
@@ -1078,7 +1104,6 @@ async def create_pack(message: types.Message, state: FSMContext):
             shutil.rmtree(temp_dir, ignore_errors=True)
         await state.clear()
 
-
 # ============================================================
 # BACK TO PANEL
 # ============================================================
@@ -1090,7 +1115,6 @@ async def back_panel(callback: types.CallbackQuery):
         return
     await callback.message.answer("💎 ELITE ADMIN PANEL", reply_markup=admin_keyboard(role))
     await callback.answer()
-
 
 # ============================================================
 # FALLBACK
@@ -1108,7 +1132,6 @@ async def fallback(message: types.Message):
         "Use /emojiid as a reply to a custom emoji message to extract IDs.\n"
         "Use /cancel to stop an operation."
     )
-
 
 # ============================================================
 # MAIN
@@ -1130,7 +1153,6 @@ async def main():
     finally:
         await bot.session.close()
         mongo_client.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
