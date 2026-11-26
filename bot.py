@@ -1209,8 +1209,9 @@ async def post_to_channel(sticker, pack_name: str, pack_title: str, sticker_type
     """Post one sticker from the new pack to the channel with an 'Add pack' button.
     Never raises: a channel problem must not affect the user's own pack."""
     if not POST_CHANNEL or POST_CHANNEL.lower() in {"off", "false", "0", "none"}:
+        logger.info("Channel posting is off (POST_CHANNEL=%r)", POST_CHANNEL)
         return
-    chat_id = int(POST_CHANNEL) if POST_CHANNEL.lstrip("-").isdigit() else POST_CHANNEL
+    chat_id = channel_chat_id()
     url = pack_url_for(pack_name, sticker_type)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [make_button(f"➕ Add {pack_title[:50]}", url=url, style=STYLE_SUCCESS)]
@@ -1225,8 +1226,52 @@ async def post_to_channel(sticker, pack_name: str, pack_title: str, sticker_type
                 logger.info("Channel sticker post failed, sending link instead: %s", exc)
         await tg_call(lambda: bot.send_message(chat_id=chat_id, text=f"🆕 {pack_title}\n{url}",
                                                reply_markup=keyboard))
-    except Exception:
+    except Exception as exc:
         logger.exception("Channel post failed (is the bot an admin of %s?)", POST_CHANNEL)
+        # Tell the owner exactly what went wrong instead of failing silently.
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"⚠️ Could not post to channel {POST_CHANNEL}\n\n"
+                f"Error: {str(exc)[:500]}\n\n"
+                "Check: POST_CHANNEL value, bot is admin with 'Post messages'. "
+                "Run /channeltest to check.",
+            )
+        except Exception:
+            pass
+
+
+def channel_chat_id():
+    value = POST_CHANNEL.strip()
+    m = re.search(r"t\.me/([A-Za-z0-9_]+)", value)
+    if m:
+        value = "@" + m.group(1)
+    if value.lstrip("-").isdigit():
+        return int(value)
+    return value if value.startswith("@") else "@" + value
+
+
+@dp.message(Command("channeltest"))
+async def cmd_channeltest(message: types.Message):
+    """Owner/admin: check that the bot can post to the channel."""
+    if not await allowed(message.from_user.id, message.from_user.username):
+        return
+    chat_id = channel_chat_id()
+    lines = [f"📡 POST_CHANNEL = {POST_CHANNEL!r}  →  {chat_id}"]
+    try:
+        chat = await bot.get_chat(chat_id)
+        lines.append(f"✅ Found channel: {chat.title} (id {chat.id})")
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
+        can_post = getattr(member, "can_post_messages", None)
+        lines.append(f"👤 Bot status: {member.status}, can post: {can_post}")
+        await bot.send_message(chat.id, "✅ Test post from the sticker bot (you can delete this).")
+        lines.append("✅ Test message posted. Channel posting works.")
+    except Exception as exc:
+        lines.append(f"❌ {str(exc)[:500]}")
+        lines.append("\nFix: set POST_CHANNEL in Railway to your channel @username "
+                     "(or -100... id) and make the bot admin with 'Post messages'.")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("collection"))
