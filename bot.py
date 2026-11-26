@@ -55,6 +55,9 @@ BRAND_TAG = os.getenv("BRAND_TAG", "@stickerclubs").strip() or "@stickerclubs"
 TITLE_SUFFIX = f" : {BRAND_TAG}"
 MAX_USER_TITLE = 64 - len(TITLE_SUFFIX)
 DEFAULT_EMOJI = "😀"
+# Showcase pack: 1 sticker from every pack anyone creates is auto-added here
+COLLECTION_ENABLED = os.getenv("COLLECTION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+COLLECTION_TITLE = os.getenv("COLLECTION_TITLE", "All Packs").strip() or "All Packs"
 VIDEO_EXTS = {".webm", ".mp4", ".mov", ".mkv", ".gif", ".avi", ".m4v", ".mpeg", ".mpg"}
 
 # Optional Telegram custom emoji IDs for button icons. Leave blank until configured.
@@ -106,6 +109,7 @@ dp = Dispatcher()
 mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = mongo_client[DB_NAME]
 users_col = db["users"]
+settings_col = db["settings"]
 
 # ============================================================
 # FSM STATES
@@ -1138,6 +1142,82 @@ def build_attempts(item, index: int, source_type: str, sticker_type: str, temp_d
 
 
 # ============================================================
+# SHOWCASE COLLECTION ("All Packs : @stickerclubs")
+# ============================================================
+async def add_to_collection(sticker, sticker_type: str):
+    """Copy one sticker into the shared collection pack (owned by OWNER_ID).
+    Never raises: a collection problem must not affect the user's own pack."""
+    if not COLLECTION_ENABLED or sticker is None:
+        return
+    try:
+        key = f"collection_{sticker_type}"
+        max_items = MAX_CUSTOM_EMOJI_PACK_ITEMS if sticker_type == "custom_emoji" else MAX_REGULAR_PACK_ITEMS
+        doc = await settings_col.find_one({"_id": key}) or {}
+        input_sticker = InputSticker(
+            sticker=sticker.file_id,
+            format=sticker_format_enum(media_kind_from_sticker(sticker)),
+            emoji_list=[sticker_emoji(sticker)],
+        )
+
+        if doc.get("name") and doc.get("count", 0) < max_items:
+            try:
+                await tg_call(lambda: bot.add_sticker_to_set(
+                    user_id=OWNER_ID, name=doc["name"], sticker=input_sticker))
+                await settings_col.update_one({"_id": key}, {"$inc": {"count": 1}})
+                return
+            except TelegramBadRequest as exc:
+                text = str(exc).upper()
+                if not any(c in text for c in PACK_FULL_ERRORS + ("STICKERSET_INVALID",)):
+                    logger.warning("Collection add rejected: %s", exc)
+                    return
+                # pack full or deleted -> fall through and start a new part
+
+        part = doc.get("part", 0) + 1
+        bot_info = await tg_call(bot.get_me)
+        title = brand_title(COLLECTION_TITLE, part)
+        for _ in range(5):
+            name = make_short_name(COLLECTION_TITLE, bot_info.username)
+            try:
+                kwargs = dict(user_id=OWNER_ID, name=name, title=title,
+                              stickers=[input_sticker], sticker_type=sticker_type)
+                if sticker_type == "custom_emoji":
+                    kwargs["needs_repainting"] = False
+                await tg_call(lambda: bot.create_new_sticker_set(**kwargs))
+                break
+            except TelegramBadRequest as exc:
+                if "SHORT_NAME_OCCUPIED" in str(exc).upper():
+                    continue
+                logger.warning("Collection create rejected: %s", exc)
+                return
+        else:
+            return
+        await settings_col.update_one(
+            {"_id": key},
+            {"$set": {"name": name, "count": 1, "part": part},
+             "$push": {"all_names": name}},
+            upsert=True,
+        )
+        logger.info("Started collection pack %s", name)
+    except Exception:
+        logger.exception("Collection update failed")
+
+
+@dp.message(Command("collection"))
+async def cmd_collection(message: types.Message):
+    """Show links to the showcase collection pack(s)."""
+    lines = []
+    for sticker_type in ("regular", "custom_emoji"):
+        doc = await settings_col.find_one({"_id": f"collection_{sticker_type}"})
+        for name in (doc or {}).get("all_names", []):
+            lines.append(f"🔗 {pack_url_for(name, sticker_type)}")
+    if not lines:
+        await message.answer("No collection pack yet. It starts with the first pack someone creates.")
+        return
+    await message.answer(f"🗂 {COLLECTION_TITLE}{TITLE_SUFFIX}\n\n" + "\n".join(lines),
+                         disable_web_page_preview=True)
+
+
+# ============================================================
 # CLONE / CREATE ENGINE
 # ============================================================
 async def run_clone(message: types.Message, state: FSMContext):
@@ -1252,13 +1332,19 @@ async def run_clone(message: types.Message, state: FSMContext):
 
         # Verify against Telegram what actually landed in the pack(s).
         verified = 0
+        showcase_sticker = None
         for pack in packs:
             try:
                 real = await tg_call(lambda: bot.get_sticker_set(name=pack["name"]))
                 pack["count"] = len(real.stickers)
+                if showcase_sticker is None and real.stickers:
+                    showcase_sticker = real.stickers[0]
             except TelegramAPIError:
                 pass
             verified += pack["count"]
+
+        # Put 1 sticker from this new pack into the shared collection.
+        await add_to_collection(showcase_sticker, sticker_type)
 
         elapsed = int(time.time() - started_at)
         first_url = pack_url_for(packs[0]["name"], sticker_type)
@@ -1340,6 +1426,7 @@ async def fallback(message: types.Message, state: FSMContext):
         "✨ Use /start to open the bot menu.\n"
         "Use /panel for administration.\n"
         "Use /emojiid as a reply to a custom emoji message to extract IDs.\n"
+        "Use /collection to see the All Packs collection.\n"
         "Use /cancel to stop an operation."
     )
 
