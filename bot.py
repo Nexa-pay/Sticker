@@ -58,6 +58,9 @@ DEFAULT_EMOJI = "😀"
 # Showcase pack: 1 sticker from every pack anyone creates is auto-added here
 COLLECTION_ENABLED = os.getenv("COLLECTION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 COLLECTION_TITLE = os.getenv("COLLECTION_TITLE", "All Packs").strip() or "All Packs"
+# Channel auto-post: 1 sticker from every new pack is posted here.
+# Use @channelusername or the numeric -100... id. Bot must be admin. Set "off" to disable.
+POST_CHANNEL = os.getenv("POST_CHANNEL", BRAND_TAG).strip()
 VIDEO_EXTS = {".webm", ".mp4", ".mov", ".mkv", ".gif", ".avi", ".m4v", ".mpeg", ".mpg"}
 
 # Optional Telegram custom emoji IDs for button icons. Leave blank until configured.
@@ -1202,6 +1205,30 @@ async def add_to_collection(sticker, sticker_type: str):
         logger.exception("Collection update failed")
 
 
+async def post_to_channel(sticker, pack_name: str, pack_title: str, sticker_type: str):
+    """Post one sticker from the new pack to the channel with an 'Add pack' button.
+    Never raises: a channel problem must not affect the user's own pack."""
+    if not POST_CHANNEL or POST_CHANNEL.lower() in {"off", "false", "0", "none"}:
+        return
+    chat_id = int(POST_CHANNEL) if POST_CHANNEL.lstrip("-").isdigit() else POST_CHANNEL
+    url = pack_url_for(pack_name, sticker_type)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [make_button(f"➕ Add {pack_title[:50]}", url=url, style=STYLE_SUCCESS)]
+    ])
+    try:
+        if sticker is not None:
+            try:
+                await tg_call(lambda: bot.send_sticker(chat_id=chat_id, sticker=sticker.file_id,
+                                                       reply_markup=keyboard))
+                return
+            except TelegramBadRequest as exc:
+                logger.info("Channel sticker post failed, sending link instead: %s", exc)
+        await tg_call(lambda: bot.send_message(chat_id=chat_id, text=f"🆕 {pack_title}\n{url}",
+                                               reply_markup=keyboard))
+    except Exception:
+        logger.exception("Channel post failed (is the bot an admin of %s?)", POST_CHANNEL)
+
+
 @dp.message(Command("collection"))
 async def cmd_collection(message: types.Message):
     """Show links to the showcase collection pack(s)."""
@@ -1345,6 +1372,8 @@ async def run_clone(message: types.Message, state: FSMContext):
 
         # Put 1 sticker from this new pack into the shared collection.
         await add_to_collection(showcase_sticker, sticker_type)
+        # Post 1 sticker from this new pack to the channel.
+        await post_to_channel(showcase_sticker, packs[0]["name"], packs[0]["title"], sticker_type)
 
         elapsed = int(time.time() - started_at)
         first_url = pack_url_for(packs[0]["name"], sticker_type)
